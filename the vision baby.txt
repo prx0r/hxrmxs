@@ -1,0 +1,148 @@
+HelloKoa v4: The AMUPN - Final Technical & Algorithmic Blueprint
+1. Core Philosophy & Architectural Vision
+This document specifies the final v4 architecture for HelloKoa, a therapeutic AI built on the Adaptive Modular User Profile Network (AMUPN). It is designed to be a dynamic, interpretable, and scientifically valid system, focused exclusively on text-based interaction.
+
+The architecture is guided by three principles derived from our development journey:
+
+Dynamic & Modular Persona: The user profile is not a static list of traits. It is a living, variable-dimensional graph that expands as a user completes more psychometric assessments. Its structure and influence are modulated by both the scientific validity of the tests and the user's own self-perception.
+
+State-Aware Fusion: The system differentiates between the user's stable, long-term persona and their immediate, conversational state. It uses a sophisticated fusion mechanism to decide how to respond, enabling it to be empathetic to the user's current feelings without losing sight of their underlying personality.
+
+Therapeutic Discovery through Emergence: The AI discovers effective therapeutic pathways not through rigid programming, but as an emergent property of its architecture. By observing which interventions resonate with different user profile clusters, the system learns and refines its understanding of therapeutic relationships, creating a self-improving "flywheel."
+
+2. System Architecture Diagram
+This flowchart illustrates the end-to-end data flow for a single interaction.
+
+graph TD
+    subgraph "Input & Profile Core (AMUPN + IEFM)"
+        A[User Message] --> B[Implicit Signal Extractor<br>(DistilRoBERTa)<br>Outputs Implicit State Vector u_imp];
+        C[ProfileNetworkService<br>(Heterogeneous Graph)<br>Computes Explicit Persona Vector u_exp];
+        B -- u_imp --> D{Arbiter Module<br>(Cross-Attention Fusion)};
+        C -- u_exp --> D;
+    end
+
+    subgraph "Reasoning & Generation Core"
+        D -- Fused Vector u_fused --> E[Neuro-Symbolic Selector<br>(Sparse GAT + Rules)<br>Selects Therapeutic Framework];
+        F[Similar User Pattern Service<br>(HDBSCAN + GraphSAGE)<br>Provides Preference Signal];
+        F --> E;
+        G[DoRA LLM Service<br>(Qwen3-1.7B-Instruct)];
+        E -- Therapeutic Framework --> G;
+        D -- u_fused --> G;
+    end
+    
+    subgraph "Evolution & Feedback Loop"
+        H[Generated Response] --> I[User];
+        I -- Feedback --> J{Causal Quality System<br>& Statistical Validator};
+        J -- Corrective Training Data --> K[LoRA Fine-Tuning];
+        K -- Updated Adapter --> G;
+    end
+
+    G --> H;
+
+
+3. Component Technical Specifications
+This section details the purpose, technology, and algorithmic implementation of each core module.
+
+3.1. ProfileNetworkService (The AMUPN Core)
+Purpose: To manage and compute the user's stable, long-term persona as a variable-dimensional, heterogeneous graph. This produces the Explicit Vector (u_exp).
+
+Core Technology: PyTorch Geometric (torch_geometric.HeteroData), PostgreSQL.
+
+Algorithmic Implementation:
+
+Graph Construction: The user profile is a HeteroData object constructed on-the-fly.
+
+Node Types: user, test_cluster (e.g., 'big_five'), dimension (e.g., 'neuroticism'). The user node holds the final aggregated vector.
+
+Edge ('user', 'has_cluster', 'test_cluster'): The edge weight is a quality-calibrated confidence score: weight = user_confidence * psychometric_quality. The user_confidence (1-10, normalized) is collected post-assessment. The psychometric_quality is a pre-defined score (e.g., BFI-2: 0.9, MBTI: 0.2) from the config, preventing unreliable tests from unduly influencing the profile.
+
+Edge ('dimension', 'correlates_with', 'dimension'): Edges connect related dimensions across different tests (e.g., Big Five 'Neuroticism' and HEXACO 'Emotionality'), weighted by their known empirical correlation.
+
+Standardization with Transformer: A dedicated 8-layer EmbeddingModule transformer standardizes the raw scores from different tests into a shared, high-dimensional embedding space before they are assigned to the dimension nodes. Its loss function is weighted by the psychometric_quality score, forcing it to learn more reliable representations for higher-quality tests.
+
+Vector Computation: A Graph Convolutional Network (specifically HeteroConv with GATConv layers) aggregates information across this graph to compute the final, variable-dimensional u_exp vector at the user node.
+
+3.2. Implicit Signal Extractor & Arbiter Module (The IEFM Core)
+Purpose: To capture the user's real-time conversational state (u_imp) and intelligently fuse it with their stable persona (u_exp).
+
+Core Technology: Hugging Face Transformers, PyTorch nn.Module.
+
+Algorithmic Implementation:
+
+Implicit Signal Extractor: A fine-tuned distilroberta-base model processes the last 4-6 conversational turns. Its regression head outputs a dense 8D Implicit Vector (u_imp) representing real-time states like [anxiety, cognitive_focus, emotional_valence, engagement_level].
+
+Arbiter Module: This crucial module performs the fusion.
+
+It uses a cross-attention mechanism where u_imp acts as the Query and u_exp acts as the Key and Value. This allows the AI to "query" the user's stable persona through the lens of their current emotional state.
+
+The output is a Fused Vector (u_fused) that is a blend of the two, controlled by a learned gamma parameter.
+
+It continuously calculates the cosine similarity between u_exp and u_imp, flagging significant divergence as a potential insight for the therapeutic discovery process.
+
+3.3. Neuro-Symbolic Selector & User Pattern Service (The Reasoning Core)
+Purpose: To select the most appropriate therapeutic framework for the current interaction and leverage social/collaborative filtering.
+
+Core Technology: PyTorch Geometric (GATConv), HDBSCAN, GraphSAGE.
+
+Algorithmic Implementation:
+
+Similar User Pattern Service:
+
+Clustering: HDBSCAN is used to cluster all user u_exp vectors, identifying robust groups of similar personality profiles.
+
+Preference Prediction: A GraphSAGE model is trained on the graph of user interactions. It learns to predict which therapeutic frameworks or styles users from a certain cluster are likely to prefer, based on the historical success of those interventions within the cluster.
+
+Neuro-Symbolic Selector:
+
+Input: Receives the u_fused vector and a preference signal from the User Pattern Service.
+
+Knowledge Graph: Traverses a Memgraph instance containing ~30 nodes representing therapeutic frameworks (e.g., CBT, DBT, ACT, Jungian Shadow Work).
+
+Selection Logic: A Sparse GAT model generates relevance scores for each framework. These scores are then filtered and re-ranked by a symbolic rule engine that enforces clinical safety (e.g., "IF crisis_score > 0.9, THEN only allow 'Crisis Response' framework"). This combines the flexibility of neural networks with the safety of expert rules.
+
+3.4. DoRALLMService & The Causal Learning Loop
+Purpose: To generate the final response and to drive the system's self-improvement.
+
+Core Technology: PEFT (DoRAConfig), PyTorch (Trainer), SciPy.
+
+Algorithmic Implementation:
+
+DoRA LLM Service:
+
+Prompt Construction: The Qwen3-1.7B-Instruct model receives a rich, dynamic prompt containing: (1) the natural language representation of the u_fused vector, and (2) an instruction based on the Therapeutic Framework selected by the GAT (e.g., "Adopt a Socratic inquiry approach to help the user challenge their assumptions.").
+
+Style Adaptation: The model's output is shaped by DoRA adapters (r=8,α=64) which control the conversational style (e.g., Relational Depth, Cognitive Structuring). The choice of adapter is managed by a Thompson Sampling algorithm, allowing for intelligent exploration.
+
+Causal Quality & Validation:
+
+The CausalQualitySystem performs LLM-based self-assessment on its own output. For poor responses, it generates "causal fix" TrainingExamples (e.g., "The response failed on empathy. A better response would have been...").
+
+The StatisticalValidator acts as a gatekeeper. Before a new LoRA adapter trained on these fixes is deployed, it is tested on a standardized validation set. The update is only committed if it passes a paired t-test (p<0.05) and shows a meaningful effect size (Cohen's d>0.3). This prevents model degradation and ensures genuine improvement.
+
+4. Data Model & Persistence
+PostgreSQL:
+
+users: Stores user_id, cluster_id, and a JSONB profile_graph containing the AMUPN structure.
+
+personality_assessments: Logs each test taken, including raw_scores, user_confidence, and the psychometric_quality used.
+
+interactions: A comprehensive log storing user_message, ai_response, the u_exp, u_imp, and u_fused vectors, the selected therapeutic_framework_id, and dora_style.
+
+training_examples: Stores high-quality data for LoRA, weighted by source (user_exemplar > causal_fix > high_rated_interaction).
+
+Memgraph: Manages the knowledge graph of Therapeutic Frameworks.
+
+5. Final Vision: The Therapeutic Discovery Flywheel
+This architecture creates a powerful "discovery flywheel":
+
+A new user joins. The system recommends exploring a therapeutic framework (e.g., DBT) based on their similarity to an existing user cluster.
+
+The user's feedback (+1/-1) on DBT-style responses refines their personal DoRA adapter and updates the success rate for DBT within their cluster.
+
+The Neuro-Symbolic Selector, seeing this user's positive response, might explore an adjacent node in the knowledge graph (e.g., connecting a DBT skill with a Mindfulness technique).
+
+If this new combination is successful for this user and others in their cluster, a new emergent pattern is identified: "Users with high Neuroticism and a preference for DBT also respond well to Mindfulness grounding."
+
+This emergent pattern can be stored as a new, soft "edge" in the knowledge graph, improving the system's recommendations for all future users in that cluster.
+
+Through this process, the AI does not just follow pre-programmed therapeutic paths; it actively discovers and validates new, effective therapeutic combinations based on the collective experience of its users, all while being guided by a safe, interpretable, and scientifically rigorous framework.

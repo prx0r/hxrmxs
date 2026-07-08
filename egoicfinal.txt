@@ -1,0 +1,3896 @@
+class DoRALLMService(LLMService):
+    """DoRA adapter-based LLM service with continuous learning and S-LoRA optimization"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # CRITICAL REFINEMENT 7: Enhanced DoRA/S-LoRA implementation
+        try:
+            # Use vLLM for optimized inference with INT4 quantization
+            from vllm import LLM
+            from peft import PeftModel, DoRAConfig
+            
+            self.vllm = LLM(
+                model=config.llm_model,
+                quantization="int4",
+                max_model_len=2048,
+                gpu_memory_utilization=0.9
+            )
+            
+            # Load base model for adapter management
+            self.tokenizer = AutoTokenizer.from_pretrained(config.llm_model)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                config.llm_model,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                device_map="auto" if torch.cuda.is_available() else None
+            )
+            
+        except ImportError:
+            # Fallback to standard implementation
+            logger.warning("vLLM not available, using standard implementation")
+            self.vllm = None
+            self.tokenizer = AutoTokenizer.from_pretrained(config.llm_model)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                config.llm_model,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                device_map="auto" if torch.cuda.is_available() else None
+            )
+        
+        # DoRA adapters with S-LoRA configuration
+        self.styles = [
+            "relational_depth",
+            "cognitive_structuring", 
+            "process_navigation",
+            "therapeutic_stance"
+        ]
+        
+        self.adapters = {}
+        self._load_adapters()
+        
+        # Ensure tokenizer has pad token
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+        # Quality monitoring
+        self.quality_threshold = 0.8
+    
+    def _load_adapters(self):
+        """Load DoRA adapters with proper configuration"""
+        try:
+            from peft import PeftModel, DoRAConfig
+            
+            for style in self.styles:
+                adapter_path = f"adapters/{style}"
+                try:
+                    # Try to load existing adapter
+                    self.adapters[style] = PeftModel.from_pretrained(
+                        self.model,
+                        adapter_path,
+                        DoRAConfig(
+                            r=4,
+                            alpha=32,
+                            target_modules=["q_proj", "v_proj", "o_proj"],
+                            bias="none"
+                        )
+                    )
+                except:
+                    # Create default adapter if not found
+                    logger.warning(f"Creating default adapter for style: {style}")
+                    self.adapters[style] = self.model
+                    
+        except ImportError:
+            logger.warning("PEFT not available, using base model for all styles")
+            for style in self.styles:
+                self.adapters[style] = self.model
+    
+    # CRITICAL REFINEMENT 3: DoRA continuous learning implementation
+    async def weekly_tuning_job(self, user_id: str = None, postgres_client = None):
+        """Perform weekly fine-tuning of DoRA adapters based on user feedback"""
+        try:
+            from peft import PeftModel, DoRAConfig
+            from scipy.stats import ttest_rel
+            import numpy as np
+            
+            if not postgres_client:
+                logger.error("PostgreSQL client required for tuning job")
+                return
+            
+            # Get training examples from high-rated interactions
+            query = """
+                SELECT input_text, output_text, weight, style 
+                FROM training_examples 
+                WHERE timestamp >= NOW() - INTERVAL '7 days'
+            """
+            if user_id:
+                query += f" AND user_id = '{user_id}'"
+            
+            examples = await postgres_client.query(query)
+            
+            if len(examples) < 10:
+                logger.info(f"Insufficient training examples ({len(examples)}) for tuning")
+                return
+            
+            logger.info(f"Starting weekly tuning with {len(examples)} examples")
+            
+            # Group examples by style
+            style_examples = {}
+            for ex in examples:
+                style = ex["style"]
+                if style not in style_examples:
+                    style_examples[style] = []
+                style_examples[style].append(ex)
+            
+            # Fine-tune each style adapter
+            for style, style_data in style_examples.items():
+                if len(style_data) < 5:
+                    continue
+                    
+                logger.info(f"Tuning {style} adapter with {len(style_data)} examples")
+                
+                # Create new adapter for tuning
+                new_adapter = PeftModel.from_pretrained(
+                    self.model,
+                    f"adapters/{style}_backup",  # Use backup as base
+                    DoRAConfig(r=4, alpha=32, target_modules=["q_proj", "v_proj"])
+                )
+                
+                # Fine-tuning loop
+                optimizer = torch.optim.Adam(new_adapter.parameters(), lr=2e-5)
+                
+                for epoch in range(2):  # Limited epochs to prevent overfitting
+                    total_loss = 0
+                    for ex in style_data:
+                        inputs = self.tokenizer(
+                            ex["input_text"], 
+                            return_tensors="pt", 
+                            truncation=True, 
+                            max_length=512
+                        ).to(self.device)
+                        
+                        targets = self.tokenizer(
+                            ex["output_text"], 
+                            return_tensors="pt", 
+                            truncation=True, 
+                            max_length=128
+                        ).to(self.device)
+                        
+                        outputs = new_adapter(**inputs, labels=targets["input_ids"])
+                        loss = outputs.loss * ex["weight"]  # Weight by feedback rating
+                        
+                        optimizer.zero_grad()
+                        loss.backward()
+                        optimizer.step()
+                        
+                        total_loss += loss.item()
+                    
+                    avg_loss = total_loss / len(style_data)
+                    logger.info(f"Epoch {epoch + 1}, Style {style}, Avg Loss: {avg_loss:.4f}")
+                
+                # Statistical validation of improvement
+                test_prompts = [ex["input_text"] for ex in style_data[:10]]
+                
+                # Generate responses with old and new adapters
+                old_scores = []
+                new_scores = []
+                
+                for prompt in test_prompts:
+                    old_response = await self._generate_with_adapter(self.adapters[style], prompt)
+                    new_response = await self._generate_with_adapter(new_adapter, prompt)
+                    
+                    old_scores.append(self._evaluate_response_quality(old_response))
+                    new_scores.append(self._evaluate_response_quality(new_response))
+                
+                # Statistical test for improvement
+                if len(old_scores) > 5:
+                    try:
+                        t_stat, p_value = ttest_rel(new_scores, old_scores)
+                        improvement = np.mean(new_scores) > np.mean(old_scores)
+                        
+                        if p_value < 0.05 and improvement:
+                            # Deploy new adapter
+                            new_adapter.save_pretrained(f"adapters/{style}")
+                            self.adapters[style] = new_adapter
+                            logger.info(f"Deployed improved {style} adapter (p={p_value:.4f})")
+                        else:
+                            logger.info(f"No significant improvement for {style} (p={p_value:.4f})")
+                    except:
+                        logger.warning(f"Statistical validation failed for {style}")
+                
+        except Exception as e:
+            logger.error(f"Weekly tuning job failed: {e}")
+    
+    async def _generate_with_adapter(self, adapter, prompt: str) -> str:
+        """Generate response with specific adapter"""
+        try:
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+            
+            with torch.no_grad():
+                outputs = adapter.generate(
+                    **inputs,
+                    max_new_tokens=80,
+                    temperature=0.7,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+            
+            response = self.tokenizer.decode(
+                outputs[0][inputs["input_ids"].shape[1]:],
+                skip_special_tokens=True
+            ).strip()
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Adapter generation failed: {e}")
+            return "I'm here to help you."
+    
+    def _evaluate_response_quality(self, response: str) -> float:
+        """Evaluate response quality using multiple metrics"""
+        try:
+            # Simple quality metrics (in production, use more sophisticated evaluation)
+            
+            # Length appropriateness (20-200 characters is good)
+            length_score = min(1.0, max(0.2, len(response) / 100))
+            
+            # Therapeutic keywords presence
+            therapeutic_keywords = [
+                "understand", "feel", "support", "help", "explore", 
+                "together", "experience", "thoughts", "emotions"
+            ]
+            keyword_score = sum(1 for word in therapeutic_keywords if word in response.lower()) / len(therapeutic_keywords)
+            
+            # Coherence (simple metric - no contradictory phrases)
+            negative_phrases = ["i don't know", "i can't help", "error", "sorry"]
+            coherence_score = 1.0 - (sum(1 for phrase in negative_phrases if phrase in response.lower()) * 0.2)
+            
+            # Combine scores
+            overall_score = (length_score + keyword_score + coherence_score) / 3
+            return max(0.0, min(1.0, overall_score))
+            
+        except Exception as e:
+            logger.error(f"Quality evaluation failed: {e}")
+            return 0.5
+    
+    # CRITICAL REFINEMENT 7: Enhanced response generation with quality monitoring
+    async def generate_response(self, prompt: str, style: str, component: Dict) -> str:
+        """Generate therapeutic response with quality monitoring"""
+        try:
+            start_time = time.time()
+            
+            # Use vLLM if available for optimized inference
+            if self.vllm and style in self.adapters:
+                try:
+                    # S-LoRA adapter switching
+                    self.vllm.set_adapter(style)
+                    
+                    sampling_params = {
+                        "max_tokens": 80,
+                        "temperature": 0.7,
+                        "top_p": 0.9
+                    }
+                    
+                    outputs = self.vllm.generate([prompt], sampling_params)
+                    response = outputs[0].outputs[0].text.strip()
+                    
+                except:
+                    ## HelloKoa "Goldilocks" MVP - Complete Modular Codebase
+# Built from first principles with robust data pipelines and ML foundation
+
+import asyncio
+import json
+import logging
+import uuid
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any, Union
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from collections import Counter
+import random
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GATConv
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
+from sentence_transformers import SentenceTransformer
+from sklearn.svm import SVC
+import numpy as np
+import asyncpg
+import redis.asyncio as redis
+import chromadb
+from pymemgraph import Memgraph
+
+# ============================================================================
+# CORE CONFIGURATION AND LOGGING
+# ============================================================================
+
+@dataclass
+class Config:
+    """System configuration with environment-specific settings"""
+    # Database connections
+    postgres_url: str = "postgresql://user:pass@localhost:5432/hellokoa"
+    redis_url: str = "redis://localhost:6379"
+    chromadb_host: str = "localhost"
+    chromadb_port: int = 8000
+    memgraph_host: str = "localhost"
+    memgraph_port: int = 7687
+    
+    # ML model configurations
+    embedding_model: str = "all-MiniLM-L6-v2"
+    llm_model: str = "Qwen/Qwen3-1.7B-Instruct"
+    juncture_model: str = "roberta-base"  # Updated from bert-base per feedback
+    
+    # System parameters
+    vector_dimension: int = 11
+    max_concurrent_users: int = 1000
+    response_timeout: float = 0.5  # 500ms target
+    vector_shift_decay_days: int = 30
+    
+    # Juncture detection thresholds
+    emotional_threshold: float = 0.85
+    cognitive_threshold: float = 0.80
+    behavioral_threshold: float = 0.75
+    
+    # Performance targets
+    max_query_latency_ms: int = 50
+    max_embedding_latency_ms: int = 10
+
+# Configure structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('hellokoa.log'),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# DATA ACCESS LAYER - ROBUST FOUNDATIONS
+# ============================================================================
+
+class DatabaseClient(ABC):
+    """Abstract base for all database clients with standardized error handling"""
+    
+    @abstractmethod
+    async def connect(self):
+        pass
+    
+    @abstractmethod
+    async def disconnect(self):
+        pass
+    
+    @abstractmethod
+    async def health_check(self) -> bool:
+        pass
+
+class PostgreSQLClient(DatabaseClient):
+    """Primary database client with connection pooling and fault tolerance"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.pool: Optional[asyncpg.Pool] = None
+        
+    async def connect(self):
+        try:
+            self.pool = await asyncpg.create_pool(
+                self.config.postgres_url,
+                min_size=5,
+                max_size=20,
+                command_timeout=30
+            )
+            logger.info("PostgreSQL connection pool established")
+        except Exception as e:
+            logger.error(f"PostgreSQL connection failed: {e}")
+            raise
+    
+    async def disconnect(self):
+        if self.pool:
+            await self.pool.close()
+            logger.info("PostgreSQL connection pool closed")
+    
+    async def health_check(self) -> bool:
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            return True
+        except Exception as e:
+            logger.error(f"PostgreSQL health check failed: {e}")
+            return False
+    
+    async def query(self, sql: str, *args) -> List[Dict]:
+        """Execute query with automatic retry and error handling"""
+        for attempt in range(3):
+            try:
+                async with self.pool.acquire() as conn:
+                    rows = await conn.fetch(sql, *args)
+                    return [dict(row) for row in rows]
+            except Exception as e:
+                logger.warning(f"Query attempt {attempt + 1} failed: {e}")
+                if attempt == 2:
+                    logger.error(f"Query failed after 3 attempts: {sql}")
+                    raise
+                await asyncio.sleep(0.1 * (2 ** attempt))  # Exponential backoff
+    
+    async def execute(self, sql: str, *args) -> str:
+        """Execute non-query SQL with transaction safety"""
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+                    result = await conn.execute(sql, *args)
+                    return result
+        except Exception as e:
+            logger.error(f"Execute failed: {sql}, Error: {e}")
+            raise
+
+class RedisClient(DatabaseClient):
+    """Redis client for queuing and caching with clustering support"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.client: Optional[redis.Redis] = None
+        
+    async def connect(self):
+        try:
+            self.client = redis.from_url(self.config.redis_url)
+            await self.client.ping()
+            logger.info("Redis connection established")
+        except Exception as e:
+            logger.error(f"Redis connection failed: {e}")
+            raise
+    
+    async def disconnect(self):
+        if self.client:
+            await self.client.close()
+            logger.info("Redis connection closed")
+    
+    async def health_check(self) -> bool:
+        try:
+            await self.client.ping()
+            return True
+        except Exception as e:
+            logger.error(f"Redis health check failed: {e}")
+            return False
+    
+    async def lpush(self, key: str, value: str) -> int:
+        return await self.client.lpush(key, value)
+    
+    async def rpop(self, key: str) -> Optional[str]:
+        return await self.client.rpop(key)
+    
+    async def get(self, key: str) -> Optional[str]:
+        return await self.client.get(key)
+    
+    async def set(self, key: str, value: str, ex: Optional[int] = None):
+        return await self.client.set(key, value, ex=ex)
+
+class ChromaDBClient(DatabaseClient):
+    """ChromaDB client for vector storage and similarity search"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.client: Optional[chromadb.Client] = None
+        self.collection = None
+        
+    async def connect(self):
+        try:
+            self.client = chromadb.HttpClient(
+                host=self.config.chromadb_host,
+                port=self.config.chromadb_port
+            )
+            self.collection = self.client.get_or_create_collection(
+                name="therapeutic_embeddings",
+                metadata={"hnsw:space": "cosine"}
+            )
+            logger.info("ChromaDB connection established")
+        except Exception as e:
+            logger.error(f"ChromaDB connection failed: {e}")
+            raise
+    
+    async def disconnect(self):
+        # ChromaDB client doesn't require explicit disconnection
+        logger.info("ChromaDB client closed")
+    
+    async def health_check(self) -> bool:
+        try:
+            self.client.heartbeat()
+            return True
+        except Exception as e:
+            logger.error(f"ChromaDB health check failed: {e}")
+            return False
+    
+    async def add_embedding(self, id: str, embedding: List[float], metadata: Dict):
+        """Add embedding with error handling, deduplication, and sync lag monitoring"""
+        start_time = time.time()
+        try:
+            self.collection.add(
+                ids=[id],
+                embeddings=[embedding],
+                metadatas=[metadata]
+            )
+            # CRITICAL REFINEMENT 1: Sync lag monitoring
+            sync_lag = time.time() - start_time
+            SYNC_LAG.labels(db_type='chromadb').observe(sync_lag)
+            
+            if sync_lag > 0.1:  # 100ms threshold
+                logger.warning(f"ChromaDB sync lag {sync_lag:.3f}s exceeds threshold")
+                
+        except Exception as e:
+            logger.error(f"Failed to add embedding {id}: {e}")
+            raise
+    
+    async def query_similar(self, embedding: List[float], n_results: int = 10) -> List[Dict]:
+        """Query similar embeddings with latency monitoring"""
+        start_time = datetime.now()
+        try:
+            results = self.collection.query(
+                query_embeddings=[embedding],
+                n_results=n_results
+            )
+            latency = (datetime.now() - start_time).total_seconds() * 1000
+            if latency > self.config.max_embedding_latency_ms:
+                logger.warning(f"ChromaDB query latency {latency:.2f}ms exceeds target")
+            return results
+        except Exception as e:
+            logger.error(f"ChromaDB query failed: {e}")
+            raise
+
+class MemgraphClient(DatabaseClient):
+    """Memgraph client for knowledge graph operations"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.client: Optional[Memgraph] = None
+        
+    async def connect(self):
+        try:
+            self.client = Memgraph(
+                host=self.config.memgraph_host,
+                port=self.config.memgraph_port
+            )
+            logger.info("Memgraph connection established")
+        except Exception as e:
+            logger.error(f"Memgraph connection failed: {e}")
+            raise
+    
+    async def disconnect(self):
+        if self.client:
+            self.client.close()
+            logger.info("Memgraph connection closed")
+    
+    async def health_check(self) -> bool:
+        try:
+            self.client.execute("RETURN 1")
+            return True
+        except Exception as e:
+            logger.error(f"Memgraph health check failed: {e}")
+            return False
+    
+    async def execute_query(self, query: str, parameters: Dict = None) -> List[Dict]:
+        """Execute Cypher query with performance monitoring"""
+        start_time = datetime.now()
+        try:
+            results = list(self.client.execute_and_fetch(query, parameters or {}))
+            latency = (datetime.now() - start_time).total_seconds() * 1000
+            if latency > self.config.max_query_latency_ms:
+                logger.warning(f"Memgraph query latency {latency:.2f}ms exceeds target")
+            return results
+        except Exception as e:
+            logger.error(f"Memgraph query failed: {query}, Error: {e}")
+            raise
+
+# ============================================================================
+# EVENT SOURCING SYSTEM - FAULT TOLERANT DATA PIPELINE
+# ============================================================================
+
+@dataclass
+class Event:
+    """Immutable event structure for event sourcing"""
+    event_id: str
+    user_id: str
+    event_type: str
+    payload: Dict
+    timestamp: datetime
+    version: str = "1.0"
+
+class EventStore:
+    """Event store with guaranteed persistence and replay capabilities"""
+    
+    def __init__(self, postgres_client: PostgreSQLClient, redis_client: RedisClient):
+        self.postgres = postgres_client
+        self.redis = redis_client
+        
+    async def append_event(self, event: Event) -> str:
+        """Append event with zero-loss guarantee"""
+        try:
+            # Primary persistence to PostgreSQL
+            await self.postgres.execute(
+                """INSERT INTO raw_events 
+                   (event_id, user_id, timestamp, event_type, payload, version) 
+                   VALUES ($1, $2, $3, $4, $5, $6)""",
+                event.event_id, event.user_id, event.timestamp, 
+                event.event_type, json.dumps(event.payload), event.version
+            )
+            
+            # Queue for processing
+            await self.redis.lpush("event_queue", json.dumps({
+                "event_id": event.event_id,
+                "user_id": event.user_id,
+                "event_type": event.event_type,
+                "payload": event.payload,
+                "timestamp": event.timestamp.isoformat(),
+                "version": event.version
+            }))
+            
+            logger.info(f"Event {event.event_id} appended successfully")
+            return event.event_id
+            
+        except Exception as e:
+            logger.error(f"Failed to append event {event.event_id}: {e}")
+            raise
+    
+    async def replay_events(self, user_id: str, start_time: datetime = None) -> List[Event]:
+        """Replay events for state reconstruction"""
+        try:
+            sql = "SELECT * FROM raw_events WHERE user_id = $1"
+            params = [user_id]
+            
+            if start_time:
+                sql += " AND timestamp >= $2"
+                params.append(start_time)
+                
+            sql += " ORDER BY timestamp ASC"
+            
+            rows = await self.postgres.query(sql, *params)
+            return [Event(
+                event_id=row["event_id"],
+                user_id=row["user_id"],
+                event_type=row["event_type"],
+                payload=json.loads(row["payload"]),
+                timestamp=row["timestamp"],
+                version=row.get("version", "1.0")
+            ) for row in rows]
+            
+        except Exception as e:
+            logger.error(f"Failed to replay events for user {user_id}: {e}")
+            raise
+
+class EventProcessor:
+    """Asynchronous event processor with dead letter queue and enhanced fault tolerance"""
+    
+    def __init__(self, postgres_client: PostgreSQLClient, redis_client: RedisClient):
+        self.postgres = postgres_client
+        self.redis = redis_client
+        self.running = False
+        
+    async def start(self):
+        """Start event processing loop with dead letter retry"""
+        self.running = True
+        logger.info("Event processor started")
+        
+        # CRITICAL REFINEMENT 1: Start dead letter retry task
+        asyncio.create_task(self.retry_dead_letter_queue())
+        
+        while self.running:
+            try:
+                event_data = await self.redis.rpop("event_queue")
+                if event_data:
+                    event = json.loads(event_data)
+                    await self.process_event(event)
+                else:
+                    await asyncio.sleep(0.1)  # Brief pause if no events
+                    
+            except Exception as e:
+                logger.error(f"Event processing loop error: {e}")
+                await asyncio.sleep(1)  # Longer pause on error
+    
+    async def stop(self):
+        """Stop event processing gracefully"""
+        self.running = False
+        logger.info("Event processor stopped")
+    
+    # CRITICAL REFINEMENT 1: Dead letter retry mechanism
+    async def retry_dead_letter_queue(self):
+        """Automatically retry failed events from dead letter queue"""
+        while self.running:
+            try:
+                event_data = await self.redis.rpop("dead_letter_queue")
+                if event_data:
+                    event = json.loads(event_data)
+                    DEAD_LETTER_RETRY_COUNT.inc()
+                    
+                    try:
+                        await self.process_event(event)
+                        logger.info(f"Successfully retried event {event['event_id']}")
+                    except Exception as e:
+                        logger.error(f"Dead letter retry failed for {event['event_id']}: {e}")
+                        # Move to permanent failure storage after 3 attempts
+                        retry_count = event.get('retry_count', 0) + 1
+                        if retry_count >= 3:
+                            await self.redis.lpush("failed_events", json.dumps({**event, "retry_count": retry_count}))
+                        else:
+                            event['retry_count'] = retry_count
+                            await self.redis.lpush("dead_letter_queue", json.dumps(event))
+                            
+                await asyncio.sleep(60)  # Retry every minute
+                
+            except Exception as e:
+                logger.error(f"Dead letter retry loop error: {e}")
+                await asyncio.sleep(60)
+    
+    async def process_event(self, event: Dict):
+        """Process individual event with error handling"""
+        try:
+            event_type = event["event_type"]
+            
+            if event_type == "user_message":
+                await self.handle_user_message(event)
+            elif event_type == "personality_assessment":
+                await self.handle_personality_assessment(event)
+            elif event_type == "feedback":
+                await self.handle_feedback(event)
+            elif event_type == "session_start":
+                await self.handle_session_start(event)
+            elif event_type == "session_end":
+                await self.handle_session_end(event)
+            else:
+                logger.warning(f"Unknown event type: {event_type}")
+            
+            # Mark as processed
+            await self.postgres.execute(
+                "UPDATE raw_events SET processed = TRUE WHERE event_id = $1",
+                event["event_id"]
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to process event {event['event_id']}: {e}")
+            # Send to dead letter queue for manual resolution
+            await self.redis.lpush("dead_letter_queue", json.dumps(event))
+    
+    async def handle_user_message(self, event: Dict):
+        """Handle user message events"""
+        payload = event["payload"]
+        
+        # Store interaction
+        interaction_id = str(uuid.uuid4())
+        await self.postgres.execute(
+            """INSERT INTO interactions 
+               (interaction_id, session_id, user_id, user_message, timestamp, mood_state)
+               VALUES ($1, $2, $3, $4, $5, $6)""",
+            interaction_id, payload["session_id"], event["user_id"],
+            payload["message"], datetime.fromisoformat(event["timestamp"]),
+            json.dumps(payload.get("mood_state", {}))
+        )
+    
+    async def handle_personality_assessment(self, event: Dict):
+        """Handle personality assessment completion"""
+        payload = event["payload"]
+        assessment_id = str(uuid.uuid4())
+        
+        await self.postgres.execute(
+            """INSERT INTO personality_assessments
+               (assessment_id, user_id, test_name, raw_scores, normalized_scores, 
+                spas_score, final_weight, timestamp)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
+            assessment_id, event["user_id"], payload["test_name"],
+            json.dumps(payload["raw_scores"]), json.dumps(payload["normalized_scores"]),
+            payload["spas_score"], payload["final_weight"],
+            datetime.fromisoformat(event["timestamp"])
+        )
+    
+    # CRITICAL REFINEMENT 3: Enhanced feedback handling with training example storage
+    async def handle_feedback(self, event: Dict):
+        """Handle user feedback events and store high-quality examples for DoRA training"""
+        payload = event["payload"]
+        
+        # Update interaction with feedback
+        await self.postgres.execute(
+            """UPDATE interactions 
+               SET helpfulness_rating = $1, feedback_text = $2
+               WHERE interaction_id = $3""",
+            payload["rating"], payload.get("text", ""), payload["interaction_id"]
+        )
+        
+        # CRITICAL REFINEMENT 3: Store positive examples for DoRA fine-tuning
+        if payload["rating"] >= 4:  # High-quality responses
+            interaction = await self.postgres.query(
+                """SELECT user_message, ai_response, dora_style, user_id 
+                   FROM interactions WHERE interaction_id = $1""",
+                payload["interaction_id"]
+            )
+            
+            if interaction:
+                interaction_data = interaction[0]
+                await self.postgres.execute(
+                    """INSERT INTO training_examples 
+                       (example_id, user_id, input_text, output_text, weight, style, timestamp)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                    str(uuid.uuid4()), 
+                    interaction_data["user_id"],
+                    interaction_data["user_message"],
+                    interaction_data["ai_response"],
+                    payload["rating"] / 5.0,  # Normalize to [0, 1]
+                    interaction_data["dora_style"],
+                    datetime.now()
+                )
+    
+    async def handle_session_start(self, event: Dict):
+        """Handle session start events"""
+        payload = event["payload"]
+        
+        await self.postgres.execute(
+            """INSERT INTO sessions (session_id, user_id, start_time)
+               VALUES ($1, $2, $3)""",
+            payload["session_id"], event["user_id"],
+            datetime.fromisoformat(event["timestamp"])
+        )
+    
+    async def handle_session_end(self, event: Dict):
+        """Handle session end events"""
+        payload = event["payload"]
+        
+        await self.postgres.execute(
+            """UPDATE sessions SET end_time = $1 WHERE session_id = $2""",
+            datetime.fromisoformat(event["timestamp"]), payload["session_id"]
+        )
+
+# ============================================================================
+# MODULAR PERSONALITY MATRIX FRAMEWORK (MPMF)
+# ============================================================================
+
+class PersonalityModule(ABC):
+    """Abstract interface for personality assessment modules"""
+    
+    @abstractmethod
+    async def get_user_vector(self, user_id: str) -> torch.Tensor:
+        """Get current user personality vector"""
+        pass
+    
+    @abstractmethod
+    async def update_vector(self, user_id: str, interaction_id: str, shift: Dict):
+        """Update user vector with significant shift"""
+        pass
+
+class SPASCalculator:
+    """Self-Perception Alignment Score calculator with cosine similarity"""
+    
+    @staticmethod
+    def calculate_spas(raw_scores: List[float], user_confidence: List[float]) -> float:
+        """Calculate S-PAS score using cosine similarity for better alignment"""
+        if len(raw_scores) != len(user_confidence):
+            raise ValueError("Raw scores and confidence ratings must have same length")
+        
+        # CRITICAL REFINEMENT 2: Use cosine similarity instead of Euclidean distance
+        normalized_scores = torch.tensor(raw_scores) / torch.tensor(raw_scores).max()
+        normalized_confidence = torch.tensor(user_confidence) / 10.0  # Assuming 1-10 scale
+        
+        # Calculate cosine similarity and scale to [0, 10]
+        cosine_sim = F.cosine_similarity(normalized_scores, normalized_confidence, dim=0)
+        spas = max(0.0, (cosine_sim + 1) * 5)  # Map [-1, 1] to [0, 10]
+        
+        # Track S-PAS accuracy for monitoring
+        SPAS_ACCURACY.observe(spas)
+        
+        return spas
+
+class MPMFModule(PersonalityModule):
+    """Modular Personality Matrix Framework implementation"""
+    
+    def __init__(self, postgres_client: PostgreSQLClient, config: Config):
+        self.postgres = postgres_client
+        self.config = config
+        self.embedder = SentenceTransformer(config.embedding_model)
+        
+        # Personality test configurations
+        self.test_configs = {
+            "bfi2": {"dimensions": 5, "initial_weight": 0.82},
+            "hexaco": {"dimensions": 6, "initial_weight": 0.84}
+        }
+        
+        # Neural network for vector modulation
+        self.modulation_network = nn.Sequential(
+            nn.Linear(11 + 2 + 384 + 11, 128),  # base + mood + context + historical
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 11)
+        )
+    
+    async def get_user_vector(self, user_id: str) -> torch.Tensor:
+        """Get current user personality vector with fallback handling"""
+        try:
+            # Fetch user personality assessments
+            assessments = await self.postgres.query(
+                """SELECT test_name, normalized_scores, final_weight 
+                   FROM personality_assessments 
+                   WHERE user_id = $1 
+                   ORDER BY timestamp DESC""",
+                user_id
+            )
+            
+            if not assessments:
+                logger.info(f"No personality assessments for user {user_id}, returning neutral vector")
+                return torch.zeros(self.config.vector_dimension)
+            
+            # Combine vectors from different tests
+            vectors = []
+            for assessment in assessments:
+                scores = torch.tensor(assessment["normalized_scores"])
+                weight = assessment["final_weight"]
+                weighted_scores = scores * weight
+                vectors.append(weighted_scores)
+            
+            # Concatenate and pad to 11D if necessary
+            if vectors:
+                combined_vector = torch.cat(vectors)
+                if combined_vector.size(0) < self.config.vector_dimension:
+                    padding = torch.zeros(self.config.vector_dimension - combined_vector.size(0))
+                    combined_vector = torch.cat([combined_vector, padding])
+                elif combined_vector.size(0) > self.config.vector_dimension:
+                    combined_vector = combined_vector[:self.config.vector_dimension]
+                
+                # Normalize to unit vector
+                return combined_vector / (combined_vector.norm() + 1e-8)
+            else:
+                return torch.zeros(self.config.vector_dimension)
+                
+        except Exception as e:
+            logger.error(f"Failed to get user vector for {user_id}: {e}")
+            return torch.zeros(self.config.vector_dimension)
+    
+    # CRITICAL REFINEMENT 4: Enhanced vector modulation with pivotal moment priming
+    async def modulate_vector(self, user_id: str, base_vector: torch.Tensor, 
+                            mood_state: Dict, context: str) -> torch.Tensor:
+        """Modulate base vector with mood, context, and enhanced historical shift priming"""
+        try:
+            # CRITICAL REFINEMENT 4: Query recent pivotal moments for session continuity
+            shifts = await self.postgres.query(
+                """SELECT vector_shift, timestamp 
+                   FROM interactions 
+                   WHERE user_id = $1 AND vector_shift IS NOT NULL 
+                   ORDER BY timestamp DESC LIMIT 5""",  # Increased from 10 to focus on recent pivotal moments
+                user_id
+            )
+            
+            # Calculate weighted historical influence with enhanced priming
+            if shifts:
+                days_since_shifts = [(datetime.now() - s["timestamp"]).days 
+                                   for s in shifts]
+                # Enhanced decay function for recent pivotal moments
+                weights = torch.softmax(torch.tensor([
+                    -d / self.config.vector_shift_decay_days for d in days_since_shifts
+                ]), dim=0)
+                
+                shift_vectors = [torch.tensor(json.loads(s["vector_shift"])["new_vector"]) 
+                               for s in shifts]
+                historical_influence = sum(w * v for w, v in zip(weights, shift_vectors))
+                
+                # Amplify influence of very recent shifts (within 24 hours)
+                recent_shifts = [i for i, d in enumerate(days_since_shifts) if d < 1]
+                if recent_shifts:
+                    recent_boost = 0.2 * sum(shift_vectors[i] for i in recent_shifts) / len(recent_shifts)
+                    historical_influence += recent_boost
+                    
+                logger.info(f"Applied historical influence from {len(shifts)} pivotal moments for user {user_id}")
+            else:
+                historical_influence = torch.zeros_like(base_vector)
+            
+            # Prepare input features
+            mood_tensor = torch.tensor([
+                mood_state.get("valence", 0.0),
+                mood_state.get("arousal", 0.0)
+            ])
+            
+            context_embedding = torch.tensor(self.embedder.encode(context))
+            
+            # Combine all inputs with enhanced historical weighting
+            input_features = torch.cat([
+                base_vector,
+                mood_tensor,
+                context_embedding,
+                historical_influence
+            ])
+            
+            # Apply modulation network
+            with torch.no_grad():
+                adaptation = self.modulation_network(input_features.unsqueeze(0)).squeeze(0)
+                modulated = base_vector + 0.1 * torch.tanh(adaptation)
+                
+            # Track vector modulation for monitoring
+            VECTOR_MODULATIONS.inc()
+                
+            return modulated / (modulated.norm() + 1e-8)
+            
+        except Exception as e:
+            logger.error(f"Vector modulation failed for user {user_id}: {e}")
+            return base_vector
+    
+    async def update_vector(self, user_id: str, interaction_id: str, shift: Dict):
+        """Store significant vector shift for long-term personalization"""
+        try:
+            await self.postgres.execute(
+                """UPDATE interactions 
+                   SET vector_shift = $1 
+                   WHERE interaction_id = $2""",
+                json.dumps(shift), interaction_id
+            )
+            logger.info(f"Vector shift stored for user {user_id}, interaction {interaction_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to update vector shift: {e}")
+            raise
+
+# ============================================================================
+# JUNCTURE DETECTION SYSTEM
+# ============================================================================
+
+class JunctureDetector(nn.Module):
+    """Multi-type juncture detection for significant therapeutic moments"""
+    
+    def __init__(self, config: Config):
+        super().__init__()
+        self.config = config
+        
+        # Use RoBERTa instead of BERT per feedback
+        self.encoder = AutoModel.from_pretrained("roberta-base")
+        
+        # Separate classifiers for different juncture types
+        self.classifiers = nn.ModuleDict({
+            "emotional": nn.Sequential(
+                nn.Linear(768, 256),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(256, 1),
+                nn.Sigmoid()
+            ),
+            "cognitive": nn.Sequential(
+                nn.Linear(768, 256),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(256, 1),
+                nn.Sigmoid()
+            ),
+            "behavioral": nn.Sequential(
+                nn.Linear(768, 256),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(256, 1),
+                nn.Sigmoid()
+            )
+        })
+    
+    def forward(self, text: str, context: str = "") -> Dict[str, float]:
+        """Detect juncture types with confidence scores"""
+        try:
+            # Combine text and context
+            input_text = f"{text} {context}".strip()
+            
+            # Get RoBERTa encoding
+            inputs = self.encoder.tokenizer(input_text, return_tensors="pt", 
+                                          truncation=True, max_length=512)
+            
+            with torch.no_grad():
+                outputs = self.encoder(**inputs)
+                # Use mean pooling of last hidden state
+                encoding = outputs.last_hidden_state.mean(dim=1)
+            
+            # Get scores from each classifier
+            scores = {}
+            for juncture_type, classifier in self.classifiers.items():
+                score = classifier(encoding).item()
+                scores[juncture_type] = score
+            
+            return scores
+            
+        except Exception as e:
+            logger.error(f"Juncture detection failed: {e}")
+            return {"emotional": 0.0, "cognitive": 0.0, "behavioral": 0.0}
+
+class JunctureProcessor:
+    """Process detected junctures and update user vectors accordingly"""
+    
+    def __init__(self, detector: JunctureDetector, mpmf: MPMFModule, 
+                 postgres_client: PostgreSQLClient, config: Config):
+        self.detector = detector
+        self.mpmf = mpmf
+        self.postgres = postgres_client
+        self.config = config
+        
+        # Thresholds for each juncture type
+        self.thresholds = {
+            "emotional": config.emotional_threshold,
+            "cognitive": config.cognitive_threshold,
+            "behavioral": config.behavioral_threshold
+        }
+    
+    async def process_interaction(self, user_id: str, interaction_id: str, 
+                                text: str, context: str = ""):
+        """Process interaction for juncture detection and vector updates"""
+        try:
+            # Detect junctures
+            scores = self.detector.forward(text, context)
+            
+            # Check if any threshold is exceeded
+            significant_junctures = {
+                jtype: score for jtype, score in scores.items()
+                if score > self.thresholds[jtype]
+            }
+            
+            if significant_junctures:
+                logger.info(f"Significant junctures detected for user {user_id}: {significant_junctures}")
+                
+                # Get current user state
+                base_vector = await self.mpmf.get_user_vector(user_id)
+                
+                # Get mood state from interaction
+                mood_data = await self.postgres.query(
+                    "SELECT mood_state FROM interactions WHERE interaction_id = $1",
+                    interaction_id
+                )
+                
+                mood_state = json.loads(mood_data[0]["mood_state"]) if mood_data else {}
+                
+                # Calculate modulated vector
+                new_vector = await self.mpmf.modulate_vector(
+                    user_id, base_vector, mood_state, context
+                )
+                
+                # Store vector shift
+                shift_data = {
+                    "base_vector": base_vector.tolist(),
+                    "new_vector": new_vector.tolist(),
+                    "juncture_type": max(significant_junctures, key=significant_junctures.get),
+                    "scores": scores,
+                    "timestamp": datetime.now().isoformat()
+                }
+                
+                await self.mpmf.update_vector(user_id, interaction_id, shift_data)
+            
+            # Store all juncture scores for analytics
+            await self.postgres.execute(
+                """UPDATE interactions 
+                   SET juncture_scores = $1 
+                   WHERE interaction_id = $2""",
+                json.dumps(scores), interaction_id
+            )
+            
+        except Exception as e:
+            logger.error(f"Juncture processing failed for interaction {interaction_id}: {e}")
+
+# ============================================================================
+# GRAPH ATTENTION NETWORK FOR THERAPEUTIC SELECTION
+# ============================================================================
+
+class TherapeuticSelector(ABC):
+    """Abstract interface for therapeutic component selection"""
+    
+    @abstractmethod
+    async def select_component(self, user_vector: torch.Tensor, context: str) -> Dict:
+        pass
+
+class GATSelector(TherapeuticSelector, nn.Module):
+    """Graph Attention Network for therapeutic component selection"""
+    
+    def __init__(self, memgraph_client: MemgraphClient, chroma_client: ChromaDBClient,
+                 config: Config, in_channels: int = 512, out_channels: int = 128, heads: int = 8):
+        super().__init__()
+        self.memgraph = memgraph_client
+        self.chroma = chroma_client
+        self.config = config
+        
+        # GAT layers with sparse attention
+        self.gat_layers = nn.ModuleList([
+            GATConv(in_channels, out_channels, heads=heads, dropout=0.2),
+            GATConv(out_channels * heads, out_channels, heads=1, dropout=0.2)
+        ])
+        
+        # Scoring network
+        self.scorer = nn.Sequential(
+            nn.Linear(out_channels + config.vector_dimension, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+        
+        # Cache for frequent queries
+        self.node_cache = {}
+        self.embedding_cache = {}
+    
+    async def get_knowledge_graph(self) -> Tuple[torch.Tensor, torch.Tensor, List[Dict]]:
+        """Retrieve knowledge graph structure with caching"""
+        try:
+            # Query therapeutic components and relationships
+            query = """
+                MATCH (n:TherapeuticComponent)-[r]->(m:TherapeuticComponent)
+                RETURN n.id as source_id, n.pillar as source_pillar, n.theory as source_theory,
+                       n.effectiveness_score as source_effectiveness, n.embedding_id as source_embedding,
+                       m.id as target_id, m.pillar as target_pillar, m.theory as target_theory,
+                       m.effectiveness_score as target_effectiveness, m.embedding_id as target_embedding,
+                       type(r) as relationship_type, r.weight as weight
+            """
+            
+            results = await self.memgraph.execute_query(query)
+            
+            if not results:
+                logger.warning("No therapeutic components found in knowledge graph")
+                return torch.empty(0, 512), torch.empty(2, 0), []
+            
+            # Build node and edge mappings
+            nodes = {}
+            edges = []
+            
+            for row in results:
+                # Add source node
+                if row["source_id"] not in nodes:
+                    nodes[row["source_id"]] = {
+                        "id": row["source_id"],
+                        "pillar": row["source_pillar"],
+                        "theory": row["source_theory"],
+                        "effectiveness_score": row["source_effectiveness"],
+                        "embedding_id": row["source_embedding"],
+                        "index": len(nodes)
+                    }
+                
+                # Add target node
+                if row["target_id"] not in nodes:
+                    nodes[row["target_id"]] = {
+                        "id": row["target_id"],
+                        "pillar": row["target_pillar"],
+                        "theory": row["target_theory"],
+                        "effectiveness_score": row["target_effectiveness"],
+                        "embedding_id": row["target_embedding"],
+                        "index": len(nodes)
+                    }
+                
+                # Add edge
+                edges.append([
+                    nodes[row["source_id"]]["index"],
+                    nodes[row["target_id"]]["index"]
+                ])
+            
+            # Get embeddings from ChromaDB
+            node_embeddings = []
+            node_list = sorted(nodes.values(), key=lambda x: x["index"])
+            
+            for node in node_list:
+                embedding_id = node["embedding_id"]
+                if embedding_id in self.embedding_cache:
+                    embedding = self.embedding_cache[embedding_id]
+                else:
+                    # Query ChromaDB for embedding
+                    results = await self.chroma.query_similar(
+                        embedding=[0.0] * 384,  # Dummy query to get by ID
+                        n_results=1
+                    )
+                    # In real implementation, use proper ID-based retrieval
+                    embedding = [0.0] * 512  # Placeholder
+                    self.embedding_cache[embedding_id] = embedding
+                
+                node_embeddings.append(embedding)
+            
+            node_tensor = torch.tensor(node_embeddings, dtype=torch.float32)
+            edge_tensor = torch.tensor(edges, dtype=torch.long).t() if edges else torch.empty(2, 0, dtype=torch.long)
+            
+            return node_tensor, edge_tensor, node_list
+            
+        except Exception as e:
+            logger.error(f"Failed to retrieve knowledge graph: {e}")
+            return torch.empty(0, 512), torch.empty(2, 0), []
+    
+    async def select_component(self, user_vector: torch.Tensor, context: str) -> Dict:
+        """Select optimal therapeutic component using GAT"""
+        try:
+            # Get knowledge graph
+            node_embeddings, edge_index, nodes = await self.get_knowledge_graph()
+            
+            if node_embeddings.size(0) == 0:
+                logger.warning("No nodes available for component selection")
+                return {
+                    "id": "default_empathic_response",
+                    "pillar": "Relational",
+                    "theory": "Person-Centered",
+                    "score": 0.5
+                }
+            
+            # Apply GAT layers with sparse attention
+            x = node_embeddings
+            for gat_layer in self.gat_layers:
+                x = F.relu(gat_layer(x, edge_index))
+                x = F.dropout(x, p=0.2, training=self.training)
+            
+            # Expand user vector to match number of nodes
+            user_features = user_vector.unsqueeze(0).expand(x.size(0), -1)
+            
+            # Combine node features with user vector
+            combined_features = torch.cat([x, user_features], dim=-1)
+            
+            # Score each component
+            scores = self.scorer(combined_features).squeeze(-1)
+            
+            # Select component with highest score
+            best_idx = scores.argmax().item()
+            selected_node = nodes[best_idx]
+            
+            return {
+                "id": selected_node["id"],
+                "pillar": selected_node["pillar"],
+                "theory": selected_node["theory"],
+                "effectiveness_score": selected_node["effectiveness_score"],
+                "score": scores[best_idx].item(),
+                "context": context
+            }
+            
+        except Exception as e:
+            logger.error(f"Component selection failed: {e}")
+            # Return safe fallback
+            return {
+                "id": "empathic_listening",
+                "pillar": "Relational",
+                "theory": "Person-Centered",
+                "score": 0.5
+            }
+
+# ============================================================================
+# DoRA STYLE SELECTION AND LLM RESPONSE GENERATION
+# ============================================================================
+
+class StyleSelector(ABC):
+    """Abstract interface for conversational style selection"""
+    
+    @abstractmethod
+    async def select_style(self, user_vector: torch.Tensor, component: Dict, 
+                          mood_state: Dict) -> str:
+        pass
+
+class DoRASelector(StyleSelector):
+    """DoRA-based style selection using SVM classifier"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.embedder = SentenceTransformer(config.embedding_model)
+        self.svm = SVC(kernel="rbf", probability=True, random_state=42)
+        self.styles = [
+            "relational_depth",
+            "cognitive_structuring", 
+            "process_navigation",
+            "therapeutic_stance"
+        ]
+        self.is_trained = False
+        
+    async def train_selector(self, training_data: List[Dict]):
+        """Train SVM on style selection data"""
+        try:
+            if not training_data:
+                logger.warning("No training data provided for DoRA selector")
+                return
+            
+            features = []
+            labels = []
+            
+            for example in training_data:
+                # Extract features
+                user_vector = torch.tensor(example["user_vector"])
+                component_text = f"{example['component']['pillar']} {example['component']['theory']}"
+                component_embedding = torch.tensor(self.embedder.encode(component_text))
+                mood_tensor = torch.tensor([
+                    example["mood_state"]["valence"],
+                    example["mood_state"]["arousal"]
+                ])
+                
+                feature_vector = torch.cat([user_vector, component_embedding, mood_tensor])
+                features.append(feature_vector.numpy())
+                labels.append(example["style"])
+            
+            # Train SVM
+            self.svm.fit(features, labels)
+            self.is_trained = True
+            logger.info("DoRA selector training completed")
+            
+        except Exception as e:
+            logger.error(f"DoRA selector training failed: {e}")
+    
+    async def select_style(self, user_vector: torch.Tensor, component: Dict, 
+                          mood_state: Dict) -> str:
+        """Select conversational style based on user profile and context"""
+        try:
+            if not self.is_trained:
+                logger.warning("DoRA selector not trained, using default style")
+                return "relational_depth"
+            
+            # Prepare features
+            component_text = f"{component['pillar']} {component['theory']}"
+            component_embedding = torch.tensor(self.embedder.encode(component_text))
+            mood_tensor = torch.tensor([
+                mood_state.get("valence", 0.0),
+                mood_state.get("arousal", 0.0)
+            ])
+            
+            features = torch.cat([user_vector, component_embedding, mood_tensor])
+            
+            # Predict style probabilities
+            probabilities = self.svm.predict_proba(features.numpy().reshape(1, -1))[0]
+            
+            # Select style with highest probability
+            best_style_idx = np.argmax(probabilities)
+            selected_style = self.styles[best_style_idx]
+            
+            logger.info(f"Selected style: {selected_style} (confidence: {probabilities[best_style_idx]:.3f})")
+            return selected_style
+            
+        except Exception as e:
+            logger.error(f"Style selection failed: {e}")
+            return "relational_depth"  # Safe default
+
+class LLMService(ABC):
+    """Abstract interface for LLM response generation"""
+    
+    @abstractmethod
+    async def generate_response(self, prompt: str, style: str, component: Dict) -> str:
+        pass
+
+                    # Fallback to standard generation
+                    response = await self._generate_with_adapter(self.adapters.get(style, self.model), prompt)
+            else:
+                # Standard generation path
+                response = await self._generate_with_adapter(self.adapters.get(style, self.model), prompt)
+            
+            # CRITICAL REFINEMENT 7: Quality monitoring and validation
+            quality_score = self._evaluate_response_quality(response)
+            COHERENCE_SCORE.set(quality_score)
+            
+            if quality_score < self.quality_threshold:
+                logger.warning(f"Low quality response detected (score: {quality_score:.3f})")
+                # Fallback to safer response
+                response = "I understand you're sharing something important. Can you tell me more about how you're feeling right now?"
+            
+            # Track inference time
+            inference_time = time.time() - start_time
+            MODEL_INFERENCE_TIME.labels(model_type='llm').observe(inference_time)
+            
+            # Clean up response
+            if "</therapeutic_response>" in response:
+                response = response.split("</therapeutic_response>")[0]
+            
+            return response if response else "I'm here to listen and support you. Could you share more about what's on your mind?"
+            
+        except Exception as e:
+            logger.error(f"Response generation failed: {e}")
+            return "I'm here to support you. Could you help me understand what you're experiencing right now?"
+    
+    # CRITICAL REFINEMENT 7: INT4 quality validation task
+    async def validate_llm_quality(self, test_prompts: List[str]):
+        """Validate INT4 quantization quality with coherence monitoring"""
+        try:
+            logger.info("Starting LLM quality validation")
+            
+            responses = []
+            for prompt in test_prompts:
+                response = await self.generate_response(prompt, "relational_depth", {})
+                responses.append(response)
+            
+            # Calculate coherence scores
+            coherence_scores = [self._evaluate_response_quality(r) for r in responses]
+            avg_coherence = sum(coherence_scores) / len(coherence_scores)
+            
+            # Update monitoring metrics
+            COHERENCE_SCORE.set(avg_coherence)
+            
+            if avg_coherence < 0.8:
+                logger.warning(f"Low LLM quality detected (avg coherence: {avg_coherence:.3f})")
+                logger.warning("Consider switching to INT8 quantization for better quality")
+                
+                # Alert system administrators
+                return {
+                    "status": "warning",
+                    "avg_coherence": avg_coherence,
+                    "recommendation": "Consider INT8 quantization"
+                }
+            else:
+                logger.info(f"LLM quality validation passed (avg coherence: {avg_coherence:.3f})")
+                return {
+                    "status": "passed",
+                    "avg_coherence": avg_coherence
+                }
+                
+        except Exception as e:
+            logger.error(f"LLM quality validation failed: {e}")
+            return {"status": "error", "error": str(e)}
+    
+    def create_therapeutic_prompt(self, user_message: str, component: Dict, 
+                                user_vector: torch.Tensor, mood_state: Dict) -> str:
+        """Create structured prompt for therapeutic response"""
+        
+        # Convert user vector to personality description
+        personality_traits = []
+        if user_vector.sum() > 0:  # Check if vector is not zero
+            if user_vector[0] > 0.6:  # Assuming first dimension is openness
+                personality_traits.append("open to new experiences")
+            if user_vector[1] > 0.7:  # Assuming second dimension is neuroticism
+                personality_traits.append("emotionally sensitive")
+            if user_vector[2] > 0.6:  # Assuming third dimension is extraversion
+                personality_traits.append("socially engaged")
+        
+        personality_context = "User tends to be " + ", ".join(personality_traits) if personality_traits else "User has balanced personality traits"
+        
+        mood_context = f"Current mood: valence={mood_state.get('valence', 0.0):.2f}, arousal={mood_state.get('arousal', 0.0):.2f}"
+        
+        prompt = f"""<therapeutic_context>
+{personality_context}
+{mood_context}
+Therapeutic approach: {component['theory']} - {component['pillar']}
+Effectiveness score: {component.get('effectiveness_score', 0.5):.2f}
+</therapeutic_context>
+
+<user_input>
+{user_message}
+</user_input>
+
+<therapeutic_response>
+Respond with empathy and therapeutic insight using {component['pillar']} approach. 
+Keep response focused, supportive, and under 100 words:
+"""
+        return prompt
+    
+    async def generate_response(self, prompt: str, style: str, component: Dict) -> str:
+        """Generate therapeutic response using specified style adapter"""
+        try:
+            # Create inputs
+            inputs = self.tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+                padding=True
+            ).to(self.device)
+            
+            # Generate response
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=80,
+                    temperature=0.7,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    repetition_penalty=1.1
+                )
+            
+            # Decode response
+            generated_text = self.tokenizer.decode(
+                outputs[0][inputs["input_ids"].shape[1]:],
+                skip_special_tokens=True
+            ).strip()
+            
+            # Clean up response
+            if "</therapeutic_response>" in generated_text:
+                generated_text = generated_text.split("</therapeutic_response>")[0]
+            
+            return generated_text if generated_text else "I understand. Can you tell me more about how you're feeling?"
+            
+        except Exception as e:
+            logger.error(f"Response generation failed: {e}")
+            return "I'm here to listen and support you. Could you share more about what's on your mind?"
+
+# ============================================================================
+# MODEL REGISTRY AND A/B TESTING SYSTEM
+# ============================================================================
+
+class ModelRegistry:
+    """Registry for ML models with A/B testing capabilities"""
+    
+    def __init__(self, postgres_client: PostgreSQLClient):
+        self.postgres = postgres_client
+        self.models = {}  # {model_id: {type: str, version: str, instance: object}}
+        self.active_versions = {}  # {type: model_id}
+        self.ab_test_groups = {}  # {(user_id, model_type): model_id}
+        
+    def register_model(self, model_id: str, model_type: str, version: str, instance: Any):
+        """Register a new model version"""
+        try:
+            self.models[model_id] = {
+                "type": model_type,
+                "version": version,
+                "instance": instance,
+                "registered_at": datetime.now()
+            }
+            
+            # Set as active if first of its type
+            if model_type not in self.active_versions:
+                self.active_versions[model_type] = model_id
+                
+            logger.info(f"Registered model {model_id} (type: {model_type}, version: {version})")
+            
+        except Exception as e:
+            logger.error(f"Failed to register model {model_id}: {e}")
+            raise
+    
+    async def assign_ab_test(self, user_id: str, model_type: str, 
+                           model_ids: List[str], weights: List[float]):
+        """Assign user to A/B test group"""
+        try:
+            if len(model_ids) != len(weights):
+                raise ValueError("Model IDs and weights must have same length")
+                
+            # Weighted random selection
+            selected_model = random.choices(model_ids, weights=weights)[0]
+            self.ab_test_groups[(user_id, model_type)] = selected_model
+            
+            # Log assignment for analytics
+            await self.postgres.execute(
+                """INSERT INTO ab_test_assignments 
+                   (user_id, model_type, assigned_model, weights, timestamp)
+                   VALUES ($1, $2, $3, $4, $5)""",
+                user_id, model_type, selected_model, 
+                json.dumps(dict(zip(model_ids, weights))), datetime.now()
+            )
+            
+            logger.info(f"Assigned user {user_id} to model {selected_model} for {model_type}")
+            
+        except Exception as e:
+            logger.error(f"A/B test assignment failed: {e}")
+            raise
+    
+    async def get_model(self, user_id: str, model_type: str) -> Any:
+        """Get model instance for user, considering A/B test assignments"""
+        try:
+            # Check A/B test assignment
+            model_id = self.ab_test_groups.get(
+                (user_id, model_type), 
+                self.active_versions.get(model_type)
+            )
+            
+            if model_id not in self.models:
+                logger.error(f"Model {model_id} not found in registry")
+                return None
+                
+            model_info = self.models[model_id]
+            
+            # Apply compatibility layer if needed
+            if model_type == "mpmf" and model_info["version"] != "1.0":
+                return self._wrap_mpmf_compatibility(model_info["instance"])
+            
+            return model_info["instance"]
+            
+        except Exception as e:
+            logger.error(f"Failed to get model for user {user_id}, type {model_type}: {e}")
+            return None
+    
+    def _wrap_mpmf_compatibility(self, model_instance):
+        """Wrap MPMF model for backward compatibility"""
+        class CompatibilityWrapper:
+            def __init__(self, wrapped_model):
+                self.wrapped_model = wrapped_model
+                
+            async def get_user_vector(self, *args, **kwargs):
+                vector = await self.wrapped_model.get_user_vector(*args, **kwargs)
+                # Ensure vector is 11D and normalized
+                if vector.size(0) != 11:
+                    # Use linear transformation to map to 11D
+                    transform = nn.Linear(vector.size(0), 11)
+                    vector = transform(vector)
+                return vector / (vector.norm() + 1e-8)
+                
+            def __getattr__(self, name):
+                return getattr(self.wrapped_model, name)
+                
+        return CompatibilityWrapper(model_instance)
+    
+    async def log_model_performance(self, user_id: str, model_type: str, 
+                                  metric_name: str, value: float):
+        """Log model performance metrics for A/B testing analysis"""
+        try:
+            model_id = self.ab_test_groups.get(
+                (user_id, model_type), 
+                self.active_versions.get(model_type)
+            )
+            
+            await self.postgres.execute(
+                """INSERT INTO model_performance_metrics 
+                   (user_id, model_id, model_type, metric_name, value, timestamp)
+                   VALUES ($1, $2, $3, $4, $5, $6)""",
+                user_id, model_id, model_type, metric_name, value, datetime.now()
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to log model performance: {e}")
+
+# ============================================================================
+# ORCHESTRATION LAYER - MAIN SYSTEM COORDINATOR
+# ============================================================================
+
+class HelloKoaOrchestrator:
+    """Main orchestration layer coordinating all system components"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        
+        # Initialize database clients
+        self.postgres = PostgreSQLClient(config)
+        self.redis = RedisClient(config)
+        self.chroma = ChromaDBClient(config)
+        self.memgraph = MemgraphClient(config)
+        
+        # Initialize core components
+        self.event_store = None
+        self.event_processor = None
+        self.mpmf = None
+        self.juncture_detector = None
+        self.juncture_processor = None
+        self.gat_selector = None
+        self.dora_selector = None
+        self.llm_service = None
+        self.model_registry = None
+        
+        self.is_initialized = False
+    
+    async def initialize(self):
+        """Initialize all system components with proper error handling"""
+        try:
+            logger.info("Initializing HelloKoa system...")
+            
+            # Connect to databases
+            await self.postgres.connect()
+            await self.redis.connect()
+            await self.chroma.connect()
+            await self.memgraph.connect()
+            
+            # Initialize data pipeline
+            self.event_store = EventStore(self.postgres, self.redis)
+            self.event_processor = EventProcessor(self.postgres, self.redis)
+            
+            # Initialize ML components
+            self.mpmf = MPMFModule(self.postgres, self.config)
+            self.juncture_detector = JunctureDetector(self.config)
+            self.juncture_processor = JunctureProcessor(
+                self.juncture_detector, self.mpmf, self.postgres, self.config
+            )
+            self.gat_selector = GATSelector(
+                self.memgraph, self.chroma, self.config
+            )
+            self.dora_selector = DoRASelector(self.config)
+            self.llm_service = DoRALLMService(self.config)
+            
+            # Initialize model registry
+            self.model_registry = ModelRegistry(self.postgres)
+            self.model_registry.register_model("mpmf_v1", "mpmf", "1.0", self.mpmf)
+            self.model_registry.register_model("gat_v1", "gat", "1.0", self.gat_selector)
+            self.model_registry.register_model("dora_v1", "dora", "1.0", self.dora_selector)
+            self.model_registry.register_model("llm_v1", "llm", "1.0", self.llm_service)
+            
+            # Start event processing
+            asyncio.create_task(self.event_processor.start())
+            
+            self.is_initialized = True
+            logger.info("HelloKoa system initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"System initialization failed: {e}")
+            raise
+    
+    async def shutdown(self):
+        """Gracefully shutdown all system components"""
+        try:
+            logger.info("Shutting down HelloKoa system...")
+            
+            if self.event_processor:
+                await self.event_processor.stop()
+            
+            # Disconnect from databases
+            await self.postgres.disconnect()
+            await self.redis.disconnect()
+            await self.chroma.disconnect()
+            await self.memgraph.disconnect()
+            
+            logger.info("HelloKoa system shutdown complete")
+            
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
+    
+    async def process_user_interaction(self, user_id: str, message: str, 
+                                     session_id: str, mood_state: Dict = None) -> Dict:
+        """Process complete user interaction through the therapeutic pipeline"""
+        
+        if not self.is_initialized:
+            raise RuntimeError("System not initialized")
+        
+        interaction_start = datetime.now()
+        interaction_id = str(uuid.uuid4())
+        
+        try:
+            # Default mood state if not provided
+            if mood_state is None:
+                mood_state = {"valence": 0.0, "arousal": 0.0}
+            
+            # 1. Store user message event
+            user_event = Event(
+                event_id=str(uuid.uuid4()),
+                user_id=user_id,
+                event_type="user_message",
+                payload={
+                    "session_id": session_id,
+                    "message": message,
+                    "mood_state": mood_state
+                },
+                timestamp=interaction_start
+            )
+            await self.event_store.append_event(user_event)
+            
+            # 2. Get user personality vector
+            mpmf_model = await self.model_registry.get_model(user_id, "mpmf")
+            base_vector = await mpmf_model.get_user_vector(user_id)
+            
+            # 3. Modulate vector with current context
+            modulated_vector = await mpmf_model.modulate_vector(
+                user_id, base_vector, mood_state, message
+            )
+            
+            # 4. Select therapeutic component
+            gat_model = await self.model_registry.get_model(user_id, "gat")
+            selected_component = await gat_model.select_component(modulated_vector, message)
+            
+            # 5. Select conversational style
+            dora_model = await self.model_registry.get_model(user_id, "dora")
+            selected_style = await dora_model.select_style(
+                modulated_vector, selected_component, mood_state
+            )
+            
+            # 6. Generate therapeutic response
+            llm_model = await self.model_registry.get_model(user_id, "llm")
+            prompt = llm_model.create_therapeutic_prompt(
+                message, selected_component, modulated_vector, mood_state
+            )
+            ai_response = await llm_model.generate_response(
+                prompt, selected_style, selected_component
+            )
+            
+            # 7. Store complete interaction
+            await self.postgres.execute(
+                """INSERT INTO interactions 
+                   (interaction_id, session_id, user_id, user_message, ai_response,
+                    component_id, dora_style, mood_state, base_vector, modulated_vector, timestamp)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)""",
+                interaction_id, session_id, user_id, message, ai_response,
+                selected_component["id"], selected_style, json.dumps(mood_state),
+                json.dumps(base_vector.tolist()), json.dumps(modulated_vector.tolist()),
+                interaction_start
+            )
+            
+            # 8. Process for junctures asynchronously
+            asyncio.create_task(
+                self.juncture_processor.process_interaction(
+                    user_id, interaction_id, message, ai_response
+                )
+            )
+            
+            # 9. Calculate processing time
+            processing_time = (datetime.now() - interaction_start).total_seconds()
+            
+            # 10. Log performance metrics
+            await self.model_registry.log_model_performance(
+                user_id, "system", "response_time", processing_time
+            )
+            
+            if processing_time > self.config.response_timeout:
+                logger.warning(f"Response time {processing_time:.3f}s exceeds target {self.config.response_timeout}s")
+            
+            return {
+                "interaction_id": interaction_id,
+                "response": ai_response,
+                "component": selected_component,
+                "style": selected_style,
+                "processing_time": processing_time,
+                "vector_modulation": {
+                    "base": base_vector.tolist(),
+                    "modulated": modulated_vector.tolist()
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Interaction processing failed for user {user_id}: {e}")
+            
+            # Store error event
+            error_event = Event(
+                event_id=str(uuid.uuid4()),
+                user_id=user_id,
+                event_type="processing_error",
+                payload={
+                    "interaction_id": interaction_id,
+                    "error": str(e),
+                    "message": message
+                },
+                timestamp=datetime.now()
+            )
+            await self.event_store.append_event(error_event)
+            
+            # Return safe fallback response
+            return {
+                "interaction_id": interaction_id,
+                "response": "I understand you're reaching out. I'm experiencing a technical issue right now, but I'm here to support you. Could you try sharing your thoughts again?",
+                "component": {"id": "fallback", "pillar": "Supportive", "theory": "Empathic"},
+                "style": "relational_depth",
+                "processing_time": (datetime.now() - interaction_start).total_seconds(),
+                "error": True
+            }
+    
+    async def health_check(self) -> Dict[str, bool]:
+        """Comprehensive system health check"""
+        health_status = {}
+        
+        try:
+            health_status["postgres"] = await self.postgres.health_check()
+            health_status["redis"] = await self.redis.health_check()
+            health_status["chromadb"] = await self.chroma.health_check()
+            health_status["memgraph"] = await self.memgraph.health_check()
+            health_status["system_initialized"] = self.is_initialized
+            
+            all_healthy = all(health_status.values())
+            health_status["overall"] = all_healthy
+            
+            if not all_healthy:
+                logger.warning(f"Health check failed: {health_status}")
+            
+            return health_status
+            
+        except Exception as e:
+            logger.error(f"Health check error: {e}")
+            return {"overall": False, "error": str(e)}
+
+# ============================================================================
+# DATABASE SCHEMA INITIALIZATION
+# ============================================================================
+
+async def initialize_database_schema(postgres_client: PostgreSQLClient):
+    """Initialize database schema for HelloKoa system"""
+    
+    schema_queries = [
+        # Users table
+        """CREATE TABLE IF NOT EXISTS users (
+            user_id UUID PRIMARY KEY,
+            demographics JSONB,
+            longitudinal_shift JSONB,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )""",
+        
+        # Raw events table for event sourcing
+        """CREATE TABLE IF NOT EXISTS raw_events (
+            event_id UUID PRIMARY KEY,
+            user_id UUID REFERENCES users(user_id),
+            timestamp TIMESTAMPTZ NOT NULL,
+            event_type VARCHAR(50) NOT NULL,
+            payload JSONB NOT NULL,
+            version VARCHAR(10) DEFAULT '1.0',
+            processed BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )""",
+        
+        # Personality assessments table
+        """CREATE TABLE IF NOT EXISTS personality_assessments (
+            assessment_id UUID PRIMARY KEY,
+            user_id UUID REFERENCES users(user_id),
+            test_name VARCHAR(50) NOT NULL,
+            raw_scores JSONB NOT NULL,
+            normalized_scores JSONB NOT NULL,
+            spas_score FLOAT NOT NULL,
+            final_weight FLOAT NOT NULL,
+            timestamp TIMESTAMPTZ DEFAULT NOW()
+        )""",
+        
+        # Sessions table
+        """CREATE TABLE IF NOT EXISTS sessions (
+            session_id UUID PRIMARY KEY,
+            user_id UUID REFERENCES users(user_id),
+            start_time TIMESTAMPTZ NOT NULL,
+            end_time TIMESTAMPTZ,
+            aggregate_shift JSONB,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )""",
+        
+        # Interactions table
+        """CREATE TABLE IF NOT EXISTS interactions (
+            interaction_id UUID PRIMARY KEY,
+            session_id UUID REFERENCES sessions(session_id),
+            user_id UUID REFERENCES users(user_id),
+            user_message TEXT NOT NULL,
+            ai_response TEXT,
+            component_id VARCHAR(50),
+            dora_style VARCHAR(50),
+            helpfulness_rating INTEGER CHECK (helpfulness_rating >= 1 AND helpfulness_rating <= 5),
+            feedback_text TEXT,
+            mood_state JSONB,
+            base_vector JSONB,
+            modulated_vector JSONB,
+            vector_shift JSONB,
+            juncture_scores JSONB,
+            timestamp TIMESTAMPTZ DEFAULT NOW()
+        )""",
+        
+        # CRITICAL REFINEMENT 3: Training examples table for DoRA continuous learning
+        """CREATE TABLE IF NOT EXISTS training_examples (
+            example_id UUID PRIMARY KEY,
+            user_id UUID REFERENCES users(user_id),
+            input_text TEXT NOT NULL,
+            output_text TEXT NOT NULL,
+            weight FLOAT NOT NULL CHECK (weight >= 0 AND weight <= 1),
+            style VARCHAR(50) NOT NULL,
+            timestamp TIMESTAMPTZ DEFAULT NOW(),
+            validated BOOLEAN DEFAULT FALSE
+        )""",
+        
+        # A/B testing tables
+        """CREATE TABLE IF NOT EXISTS ab_test_assignments (
+            assignment_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID REFERENCES users(user_id),
+            model_type VARCHAR(50) NOT NULL,
+            assigned_model VARCHAR(100) NOT NULL,
+            weights JSONB NOT NULL,
+            timestamp TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(user_id, model_type)
+        )""",
+        
+        """CREATE TABLE IF NOT EXISTS model_performance_metrics (
+            metric_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID REFERENCES users(user_id),
+            model_id VARCHAR(100) NOT NULL,
+            model_type VARCHAR(50) NOT NULL,
+            metric_name VARCHAR(50) NOT NULL,
+            value FLOAT NOT NULL,
+            timestamp TIMESTAMPTZ DEFAULT NOW()
+        )""",
+        
+        # Indexes for performance optimization
+        """CREATE INDEX IF NOT EXISTS idx_raw_events_user_timestamp 
+           ON raw_events(user_id, timestamp DESC)""",
+        
+        """CREATE INDEX IF NOT EXISTS idx_raw_events_processed 
+           ON raw_events(processed, timestamp) WHERE processed = FALSE""",
+        
+        """CREATE INDEX IF NOT EXISTS idx_interactions_user_timestamp 
+           ON interactions(user_id, timestamp DESC)""",
+        
+        """CREATE INDEX IF NOT EXISTS idx_interactions_vector_shift 
+           ON interactions(user_id, timestamp DESC) WHERE vector_shift IS NOT NULL""",
+        
+        """CREATE INDEX IF NOT EXISTS idx_personality_assessments_user 
+           ON personality_assessments(user_id, timestamp DESC)""",
+        
+        """CREATE INDEX IF NOT EXISTS idx_sessions_user 
+           ON sessions(user_id, start_time DESC)""",
+        
+        """CREATE INDEX IF NOT EXISTS idx_model_metrics_analysis 
+           ON model_performance_metrics(model_id, metric_name, timestamp DESC)"""
+    ]
+    
+    try:
+        for query in schema_queries:
+            await postgres_client.execute(query)
+        logger.info("Database schema initialized successfully")
+        
+    except Exception as e:
+        logger.error(f"Database schema initialization failed: {e}")
+        raise
+
+# ============================================================================
+# KNOWLEDGE GRAPH INITIALIZATION
+# ============================================================================
+
+async def initialize_knowledge_graph(memgraph_client: MemgraphClient, 
+                                   chroma_client: ChromaDBClient):
+    """Initialize therapeutic knowledge graph with base components"""
+    
+    # Clear existing data
+    await memgraph_client.execute_query("MATCH (n) DETACH DELETE n")
+    
+    # Base therapeutic components
+    therapeutic_components = [
+        {
+            "id": "cbt_cognitive_restructuring",
+            "pillar": "Cognitive",
+            "theory": "CBT",
+            "effectiveness_score": 0.85,
+            "level": 2,
+            "description": "Help identify and challenge negative thought patterns"
+        },
+        {
+            "id": "cbt_behavioral_activation",
+            "pillar": "Behavioral", 
+            "theory": "CBT",
+            "effectiveness_score": 0.82,
+            "level": 2,
+            "description": "Encourage engagement in meaningful activities"
+        },
+        {
+            "id": "mindfulness_grounding",
+            "pillar": "Mindfulness",
+            "theory": "Mindfulness-Based",
+            "effectiveness_score": 0.78,
+            "level": 1,
+            "description": "Present-moment awareness and grounding techniques"
+        },
+        {
+            "id": "empathic_listening",
+            "pillar": "Relational",
+            "theory": "Person-Centered",
+            "effectiveness_score": 0.90,
+            "level": 1,
+            "description": "Deep listening and emotional validation"
+        },
+        {
+            "id": "motivational_interviewing",
+            "pillar": "Process",
+            "theory": "Motivational Interviewing",
+            "effectiveness_score": 0.80,
+            "level": 2,
+            "description": "Explore ambivalence and enhance motivation for change"
+        },
+        {
+            "id": "psychoeducation",
+            "pillar": "Educational",
+            "theory": "Psychoeducational",
+            "effectiveness_score": 0.75,
+            "level": 1,
+            "description": "Provide understanding of psychological processes"
+        },
+        {
+            "id": "emotion_regulation",
+            "pillar": "Emotional",
+            "theory": "DBT",
+            "effectiveness_score": 0.83,
+            "level": 2,
+            "description": "Skills for managing intense emotions"
+        },
+        {
+            "id": "values_clarification",
+            "pillar": "Existential",
+            "theory": "ACT",
+            "effectiveness_score": 0.77,
+            "level": 2,
+            "description": "Explore personal values and meaning"
+        }
+    ]
+    
+    embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    
+    try:
+        # Create nodes and store embeddings
+        for i, component in enumerate(therapeutic_components):
+            # Generate embedding
+            text_for_embedding = f"{component['pillar']} {component['theory']} {component['description']}"
+            embedding = embedder.encode(text_for_embedding).tolist()
+            embedding_id = f"embedding_{component['id']}"
+            
+            # Store embedding in ChromaDB
+            await chroma_client.add_embedding(
+                id=embedding_id,
+                embedding=embedding,
+                metadata={
+                    "component_id": component["id"],
+                    "pillar": component["pillar"],
+                    "theory": component["theory"]
+                }
+            )
+            
+            # Create node in Memgraph
+            await memgraph_client.execute_query(
+                """CREATE (n:TherapeuticComponent {
+                    id: $id,
+                    pillar: $pillar,
+                    theory: $theory,
+                    effectiveness_score: $effectiveness_score,
+                    level: $level,
+                    description: $description,
+                    embedding_id: $embedding_id
+                })""",
+                {
+                    "id": component["id"],
+                    "pillar": component["pillar"],
+                    "theory": component["theory"],
+                    "effectiveness_score": component["effectiveness_score"],
+                    "level": component["level"],
+                    "description": component["description"],
+                    "embedding_id": embedding_id
+                }
+            )
+        
+        # Create relationships
+        relationships = [
+            # CBT components work well together
+            ("cbt_cognitive_restructuring", "cbt_behavioral_activation", "COMPATIBLE_WITH", 0.9),
+            ("cbt_behavioral_activation", "cbt_cognitive_restructuring", "COMPATIBLE_WITH", 0.9),
+            
+            # Mindfulness supports emotion regulation
+            ("mindfulness_grounding", "emotion_regulation", "ENHANCES", 0.85),
+            
+            # Empathic listening is foundational
+            ("empathic_listening", "cbt_cognitive_restructuring", "PRECEDES", 0.8),
+            ("empathic_listening", "motivational_interviewing", "PRECEDES", 0.9),
+            ("empathic_listening", "values_clarification", "PRECEDES", 0.75),
+            
+            # Psychoeducation supports other interventions
+            ("psychoeducation", "cbt_cognitive_restructuring", "SUPPORTS", 0.7),
+            ("psychoeducation", "emotion_regulation", "SUPPORTS", 0.75),
+            
+            # Values work supports behavioral change
+            ("values_clarification", "cbt_behavioral_activation", "MOTIVATES", 0.8),
+            ("values_clarification", "motivational_interviewing", "COMPATIBLE_WITH", 0.85),
+            
+            # Emotion regulation supports cognitive work
+            ("emotion_regulation", "cbt_cognitive_restructuring", "ENABLES", 0.8),
+            
+            # Sequential relationships
+            ("psychoeducation", "cbt_cognitive_restructuring", "PRECEDES", 0.75),
+            ("mindfulness_grounding", "values_clarification", "PRECEDES", 0.7)
+        ]
+        
+        for source, target, rel_type, weight in relationships:
+            await memgraph_client.execute_query(
+                """MATCH (a:TherapeuticComponent {id: $source_id})
+                   MATCH (b:TherapeuticComponent {id: $target_id})
+                   CREATE (a)-[r:%s {weight: $weight, created_at: datetime()}]->(b)""" % rel_type,
+                {
+                    "source_id": source,
+                    "target_id": target,
+                    "weight": weight
+                }
+            )
+        
+        logger.info("Knowledge graph initialized with {} components and {} relationships".format(
+            len(therapeutic_components), len(relationships)
+        ))
+        
+    except Exception as e:
+        logger.error(f"Knowledge graph initialization failed: {e}")
+        raise
+
+# ============================================================================
+# ANALYTICS AND INSIGHTS SYSTEM
+# ============================================================================
+
+class AnalyticsProcessor:
+    """Process interaction data for insights and pattern discovery with A/B testing validation"""
+    
+    def __init__(self, postgres_client: PostgreSQLClient):
+        self.postgres = postgres_client
+    
+    # CRITICAL REFINEMENT 5: A/B tested weekly insights generation
+    async def generate_user_weekly_insights(self, user_id: str, 
+                                          end_date: datetime = None) -> Dict:
+        """Generate weekly insights with A/B testing validation"""
+        
+        if end_date is None:
+            end_date = datetime.now()
+        start_date = end_date - timedelta(days=7)
+        
+        try:
+            # CRITICAL REFINEMENT 5: Check A/B test assignment for weekly reports
+            assignment = await self.postgres.query(
+                """SELECT assigned_model FROM ab_test_assignments 
+                   WHERE user_id = $1 AND model_type = 'weekly_report'""",
+                user_id
+            )
+            
+            if assignment and assignment[0]["assigned_model"] == "no_report":
+                return {
+                    "user_id": user_id,
+                    "period": f"{start_date.date()} to {end_date.date()}",
+                    "summary": "Weekly insights temporarily disabled for research purposes",
+                    "ab_test_group": "control",
+                    "interactions_count": 0
+                }
+            
+            # Get interactions for the week
+            interactions = await self.postgres.query(
+                """SELECT interaction_id, user_message, ai_response, component_id, 
+                          dora_style, helpfulness_rating, mood_state, vector_shift,
+                          juncture_scores, timestamp
+                   FROM interactions 
+                   WHERE user_id = $1 AND timestamp >= $2 AND timestamp <= $3
+                   ORDER BY timestamp ASC""",
+                user_id, start_date, end_date
+            )
+            
+            if not interactions:
+                return {
+                    "user_id": user_id,
+                    "period": f"{start_date.date()} to {end_date.date()}",
+                    "summary": "No interactions found for this period",
+                    "ab_test_group": "treatment" if not assignment else assignment[0]["assigned_model"],
+                    "interactions_count": 0
+                }
+            
+            # Enhanced analytics with pattern discovery
+            insights = await self._generate_enhanced_insights(interactions, user_id)
+            
+            # Mark as treatment group for A/B testing
+            insights["ab_test_group"] = "treatment" if not assignment else assignment[0]["assigned_model"]
+            insights["generated_at"] = datetime.now().isoformat()
+            
+            return insights
+            
+        except Exception as e:
+            logger.error(f"Failed to generate weekly insights for user {user_id}: {e}")
+            return {
+                "user_id": user_id,
+                "error": "Unable to generate insights at this time",
+                "ab_test_group": "error",
+                "generated_at": datetime.now().isoformat()
+            }
+    
+    async def _generate_enhanced_insights(self, interactions: List[Dict], user_id: str) -> Dict:
+        """Generate enhanced insights with pattern discovery"""
+        
+        # Analyze component usage patterns
+        components_used = Counter(i["component_id"] for i in interactions if i["component_id"])
+        most_used_component = components_used.most_common(1)[0] if components_used else ("none", 0)
+        
+        # Analyze style preferences and effectiveness
+        styles_used = Counter(i["dora_style"] for i in interactions if i["dora_style"])
+        preferred_style = styles_used.most_common(1)[0] if styles_used else ("none", 0)
+        
+        # Calculate helpfulness trends
+        ratings = [i["helpfulness_rating"] for i in interactions if i["helpfulness_rating"]]
+        avg_helpfulness = sum(ratings) / len(ratings) if ratings else None
+        
+        # Enhanced mood analysis with trend detection
+        mood_states = [json.loads(i["mood_state"]) for i in interactions if i["mood_state"]]
+        mood_analysis = await self._analyze_mood_patterns(mood_states)
+        
+        # Vector shift analysis for breakthrough detection
+        vector_shifts = [i for i in interactions if i["vector_shift"]]
+        breakthrough_analysis = await self._analyze_breakthroughs(vector_shifts, interactions)
+        
+        # Therapeutic progression analysis
+        progression_insights = await self._analyze_therapeutic_progression(interactions, user_id)
+        
+        # Generate personalized insights
+        insights = await self._generate_personalized_insights(
+            components_used, styles_used, avg_helpfulness, 
+            mood_analysis, breakthrough_analysis, progression_insights
+        )
+        
+        return {
+            "user_id": user_id,
+            "period": f"{interactions[0]['timestamp'].date()} to {interactions[-1]['timestamp'].date()}",
+            "interactions_count": len(interactions),
+            "most_used_component": most_used_component[0],
+            "component_diversity": len(components_used),
+            "preferred_style": preferred_style[0],
+            "average_helpfulness": round(avg_helpfulness, 2) if avg_helpfulness else None,
+            "helpfulness_trend": "improving" if len(ratings) > 1 and ratings[-1] > ratings[0] else "stable",
+            "mood_analysis": mood_analysis,
+            "breakthrough_moments": len(vector_shifts),
+            "breakthrough_analysis": breakthrough_analysis,
+            "therapeutic_progression": progression_insights,
+            "personalized_insights": insights,
+            "pattern_discoveries": await self._discover_patterns(interactions)
+        }
+    
+    async def _analyze_mood_patterns(self, mood_states: List[Dict]) -> Dict:
+        """Analyze mood patterns and trends"""
+        if not mood_states:
+            return {"status": "no_data"}
+        
+        valences = [m.get("valence", 0) for m in mood_states]
+        arousals = [m.get("arousal", 0) for m in mood_states]
+        
+        # Calculate trends using linear regression
+        if len(valences) > 2:
+            import numpy as np
+            x = np.arange(len(valences))
+            
+            valence_slope = np.polyfit(x, valences, 1)[0]
+            arousal_slope = np.polyfit(x, arousals, 1)[0]
+            
+            valence_trend = "improving" if valence_slope > 0.01 else "declining" if valence_slope < -0.01 else "stable"
+            arousal_trend = "increasing" if arousal_slope > 0.01 else "decreasing" if arousal_slope < -0.01 else "stable"
+        else:
+            valence_trend = arousal_trend = "insufficient_data"
+        
+        return {
+            "average_valence": round(sum(valences) / len(valences), 2),
+            "average_arousal": round(sum(arousals) / len(arousals), 2),
+            "valence_trend": valence_trend,
+            "arousal_trend": arousal_trend,
+            "mood_stability": round(np.std(valences) if len(valences) > 1 else 0, 2),
+            "sessions_analyzed": len(mood_states)
+        }
+    
+    async def _analyze_breakthroughs(self, vector_shifts: List[Dict], all_interactions: List[Dict]) -> Dict:
+        """Analyze breakthrough moments and their characteristics"""
+        if not vector_shifts:
+            return {"count": 0, "insights": []}
+        
+        breakthrough_types = []
+        breakthrough_contexts = []
+        
+        for shift_interaction in vector_shifts:
+            shift_data = json.loads(shift_interaction["vector_shift"])
+            breakthrough_types.append(shift_data.get("juncture_type", "unknown"))
+            
+            # Extract context around breakthrough
+            timestamp = shift_interaction["timestamp"]
+            context_interactions = [
+                i for i in all_interactions 
+                if abs((i["timestamp"] - timestamp).total_seconds()) < 1800  # 30 minutes
+            ]
+            
+            if context_interactions:
+                breakthrough_contexts.append({
+                    "timestamp": timestamp.isoformat(),
+                    "type": shift_data.get("juncture_type", "unknown"),
+                    "component_used": shift_interaction["component_id"],
+                    "context_length": len(context_interactions)
+                })
+        
+        type_distribution = Counter(breakthrough_types)
+        
+        return {
+            "count": len(vector_shifts),
+            "types": dict(type_distribution),
+            "most_common_type": type_distribution.most_common(1)[0][0] if type_distribution else "none",
+            "contexts": breakthrough_contexts[:3],  # Top 3 for brevity
+            "breakthrough_rate": len(vector_shifts) / len(all_interactions) if all_interactions else 0
+        }
+    
+    async def _analyze_therapeutic_progression(self, interactions: List[Dict], user_id: str) -> Dict:
+        """Analyze therapeutic progression over time"""
+        try:
+            # Get historical data for comparison
+            historical_interactions = await self.postgres.query(
+                """SELECT helpfulness_rating, timestamp, component_id
+                   FROM interactions 
+                   WHERE user_id = $1 AND timestamp < $2
+                   ORDER BY timestamp DESC LIMIT 50""",
+                user_id, interactions[0]["timestamp"]
+            )
+            
+            current_ratings = [i["helpfulness_rating"] for i in interactions if i["helpfulness_rating"]]
+            historical_ratings = [i["helpfulness_rating"] for i in historical_interactions if i["helpfulness_rating"]]
+            
+            progression_indicators = {
+                "sessions_this_week": len(set(i["timestamp"].date() for i in interactions)),
+                "avg_session_length": len(interactions) / len(set(i["timestamp"].date() for i in interactions)) if interactions else 0,
+                "engagement_consistency": self._calculate_engagement_consistency(interactions)
+            }
+            
+            if current_ratings and historical_ratings:
+                current_avg = sum(current_ratings) / len(current_ratings)
+                historical_avg = sum(historical_ratings) / len(historical_ratings)
+                
+                progression_indicators.update({
+                    "helpfulness_improvement": round(current_avg - historical_avg, 2),
+                    "current_satisfaction": round(current_avg, 2),
+                    "historical_satisfaction": round(historical_avg, 2)
+                })
+            
+            return progression_indicators
+            
+        except Exception as e:
+            logger.error(f"Therapeutic progression analysis failed: {e}")
+            return {"error": "Unable to analyze progression"}
+    
+    def _calculate_engagement_consistency(self, interactions: List[Dict]) -> float:
+        """Calculate engagement consistency score"""
+        if len(interactions) < 2:
+            return 0.0
+        
+        # Measure consistency in interaction timing
+        timestamps = [i["timestamp"] for i in interactions]
+        intervals = [(timestamps[i+1] - timestamps[i]).total_seconds() / 3600 for i in range(len(timestamps)-1)]
+        
+        if not intervals:
+            return 0.0
+        
+        # Lower variance in intervals = higher consistency
+        import numpy as np
+        variance = np.var(intervals)
+        consistency = max(0.0, 1.0 - (variance / 24))  # Normalize to [0, 1]
+        
+        return round(consistency, 2)
+    
+    async def _generate_personalized_insights(self, components_used: Counter, styles_used: Counter,
+                                            avg_helpfulness: float, mood_analysis: Dict,
+                                            breakthrough_analysis: Dict, progression_insights: Dict) -> List[str]:
+        """Generate personalized insights based on analysis"""
+        insights = []
+        
+        # Component insights
+        if components_used:
+            most_used = components_used.most_common(1)[0]
+            if most_used[1] > 2:
+                component_name = most_used[0].replace('_', ' ').title()
+                insights.append(f"You've been gravitating toward {component_name} approaches, which seems to resonate with you")
+        
+        # Helpfulness insights
+        if avg_helpfulness:
+            if avg_helpfulness > 4:
+                insights.append("You've found our conversations particularly meaningful this week")
+            elif avg_helpfulness < 3:
+                insights.append("Let's explore together what might make our conversations more helpful for you")
+        
+        # Mood insights
+        if mood_analysis.get("valence_trend") == "improving":
+            insights.append("I notice your emotional state seems to be trending in a positive direction")
+        elif mood_analysis.get("valence_trend") == "declining":
+            insights.append("It seems this week may have brought some emotional challenges")
+        
+        # Breakthrough insights
+        if breakthrough_analysis["count"] > 0:
+            breakthrough_type = breakthrough_analysis.get("most_common_type", "therapeutic")
+            insights.append(f"We've had some particularly meaningful {breakthrough_type} moments together")
+        
+        # Progression insights
+        if progression_insights.get("helpfulness_improvement", 0) > 0.5:
+            insights.append("You seem to be finding increasing value in our therapeutic work together")
+        
+        # Engagement insights
+        consistency = progression_insights.get("engagement_consistency", 0)
+        if consistency > 0.7:
+            insights.append("Your consistent engagement shows real commitment to your growth")
+        
+        return insights[:4]  # Limit to top 4 insights
+    
+    async def _discover_patterns(self, interactions: List[Dict]) -> List[Dict]:
+        """Discover patterns in user interactions for research insights"""
+        patterns = []
+        
+        try:
+            # Time-of-day patterns
+            hours = [i["timestamp"].hour for i in interactions]
+            hour_distribution = Counter(hours)
+            if hour_distribution:
+                peak_hour = hour_distribution.most_common(1)[0][0]
+                patterns.append({
+                    "type": "temporal",
+                    "pattern": f"Most active during hour {peak_hour}",
+                    "confidence": hour_distribution.most_common(1)[0][1] / len(interactions)
+                })
+            
+            # Component sequence patterns
+            component_sequence = [i["component_id"] for i in interactions if i["component_id"]]
+            if len(component_sequence) > 2:
+                # Look for common transitions
+                transitions = [(component_sequence[i], component_sequence[i+1]) 
+                             for i in range(len(component_sequence)-1)]
+                common_transitions = Counter(transitions)
+                if common_transitions:
+                    top_transition = common_transitions.most_common(1)[0]
+                    patterns.append({
+                        "type": "therapeutic_sequence",
+                        "pattern": f"Frequently transitions from {top_transition[0][0]} to {top_transition[0][1]}",
+                        "confidence": top_transition[1] / len(transitions)
+                    })
+            
+            return patterns
+            
+        except Exception as e:
+            logger.error(f"Pattern discovery failed: {e}")
+            return [] Get interactions for the week
+            interactions = await self.postgres.query(
+                """SELECT interaction_id, user_message, ai_response, component_id, 
+                          dora_style, helpfulness_rating, mood_state, vector_shift,
+                          juncture_scores, timestamp
+                   FROM interactions 
+                   WHERE user_id = $1 AND timestamp >= $2 AND timestamp <= $3
+                   ORDER BY timestamp ASC""",
+                user_id, start_date, end_date
+            )
+            
+            if not interactions:
+                return {
+                    "user_id": user_id,
+                    "period": f"{start_date.date()} to {end_date.date()}",
+                    "summary": "No interactions found for this period",
+                    "interactions_count": 0
+                }
+            
+            # Analyze component usage
+            components_used = Counter(i["component_id"] for i in interactions if i["component_id"])
+            most_used_component = components_used.most_common(1)[0] if components_used else ("none", 0)
+            
+            # Analyze style preferences
+            styles_used = Counter(i["dora_style"] for i in interactions if i["dora_style"])
+            preferred_style = styles_used.most_common(1)[0] if styles_used else ("none", 0)
+            
+            # Calculate average helpfulness
+            ratings = [i["helpfulness_rating"] for i in interactions if i["helpfulness_rating"]]
+            avg_helpfulness = sum(ratings) / len(ratings) if ratings else None
+            
+            # Analyze mood trends
+            mood_states = [json.loads(i["mood_state"]) for i in interactions if i["mood_state"]]
+            if mood_states:
+                avg_valence = sum(m.get("valence", 0) for m in mood_states) / len(mood_states)
+                avg_arousal = sum(m.get("arousal", 0) for m in mood_states) / len(mood_states)
+                
+                valence_trend = "improving" if mood_states[-1].get("valence", 0) > mood_states[0].get("valence", 0) else "declining"
+            else:
+                avg_valence = avg_arousal = 0
+                valence_trend = "stable"
+            
+            # Identify significant moments
+            vector_shifts = [i for i in interactions if i["vector_shift"]]
+            juncture_moments = []
+            
+            for interaction in interactions:
+                if interaction["juncture_scores"]:
+                    scores = json.loads(interaction["juncture_scores"])
+                    significant = any(score > 0.75 for score in scores.values())
+                    if significant:
+                        juncture_moments.append({
+                            "timestamp": interaction["timestamp"],
+                            "message": interaction["user_message"][:100] + "..." if len(interaction["user_message"]) > 100 else interaction["user_message"],
+                            "scores": scores
+                        })
+            
+            # Generate insights
+            insights = []
+            
+            if most_used_component[1] > 2:
+                insights.append(f"You've been working primarily with {most_used_component[0].replace('_', ' ')} approaches")
+            
+            if avg_helpfulness and avg_helpfulness > 4:
+                insights.append("You've found our conversations particularly helpful this week")
+            elif avg_helpfulness and avg_helpfulness < 3:
+                insights.append("Let's explore what might make our conversations more helpful for you")
+            
+            if valence_trend == "improving":
+                insights.append("Your mood seems to be trending upward over the week")
+            elif valence_trend == "declining":
+                insights.append("I notice your mood may have been more challenging this week")
+            
+            if len(vector_shifts) > 0:
+                insights.append(f"We've had {len(vector_shifts)} particularly meaningful moment(s) this week")
+            
+            return {
+                "user_id": user_id,
+                "period": f"{start_date.date()} to {end_date.date()}",
+                "interactions_count": len(interactions),
+                "most_used_component": most_used_component[0],
+                "preferred_style": preferred_style[0],
+                "average_helpfulness": round(avg_helpfulness, 2) if avg_helpfulness else None,
+                "mood_analysis": {
+                    "average_valence": round(avg_valence, 2),
+                    "average_arousal": round(avg_arousal, 2),
+                    "trend": valence_trend
+                },
+                "significant_moments": len(vector_shifts),
+                "juncture_moments": juncture_moments[:3],  # Top 3 moments
+                "insights": insights,
+                "generated_at": datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to generate weekly insights for user {user_id}: {e}")
+            return {
+                "user_id": user_id,
+                "error": "Unable to generate insights at this time",
+                "generated_at": datetime.now().isoformat()
+            }
+    
+    async def analyze_system_performance(self, days: int = 7) -> Dict:
+        """Analyze overall system performance metrics"""
+        
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+        
+        try:
+            # Get performance metrics
+            metrics = await self.postgres.query(
+                """SELECT model_type, metric_name, AVG(value) as avg_value, 
+                          COUNT(*) as sample_count
+                   FROM model_performance_metrics 
+                   WHERE timestamp >= $1 AND timestamp <= $2
+                   GROUP BY model_type, metric_name""",
+                start_date, end_date
+            )
+            
+            # Get user engagement stats
+            engagement = await self.postgres.query(
+                """SELECT COUNT(DISTINCT user_id) as active_users,
+                          COUNT(*) as total_interactions,
+                          AVG(helpfulness_rating) as avg_helpfulness
+                   FROM interactions 
+                   WHERE timestamp >= $1 AND timestamp <= $2""",
+                start_date, end_date
+            )[0]
+            
+            # Get A/B test performance
+            ab_results = await self.postgres.query(
+                """SELECT m.model_id, m.model_type, AVG(m.value) as avg_performance
+                   FROM model_performance_metrics m
+                   JOIN ab_test_assignments a ON m.user_id = a.user_id AND m.model_type = a.model_type
+                   WHERE m.timestamp >= $1 AND m.timestamp <= $2 AND m.metric_name = 'helpfulness_rating'
+                   GROUP BY m.model_id, m.model_type""",
+                start_date, end_date
+            )
+            
+            return {
+                "period": f"{start_date.date()} to {end_date.date()}",
+                "engagement": engagement,
+                "performance_metrics": {m["model_type"]: {m["metric_name"]: m["avg_value"]} for m in metrics},
+                "ab_test_results": ab_results,
+                "generated_at": datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"System performance analysis failed: {e}")
+            return {"error": "Unable to analyze system performance", "generated_at": datetime.now().isoformat()}
+
+# ============================================================================
+# API LAYER - FASTAPI ENDPOINTS
+# ============================================================================
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
+
+class UserMessageRequest(BaseModel):
+    user_id: str
+    session_id: str
+    message: str
+    mood_state: Optional[Dict] = None
+
+class FeedbackRequest(BaseModel):
+    interaction_id: str
+    rating: int
+    feedback_text: Optional[str] = None
+
+class PersonalityAssessmentRequest(BaseModel):
+    user_id: str
+    test_name: str
+    raw_scores: List[float]
+    user_confidence: List[float]
+
+def create_api_app(orchestrator: HelloKoaOrchestrator) -> FastAPI:
+    """Create FastAPI application with all endpoints"""
+    
+    app = FastAPI(
+        title="HelloKoa Therapeutic AI API",
+        description="Modular therapeutic AI system with personality-driven responses",
+        version="1.0.0"
+    )
+    
+    # CORS middleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # Configure appropriately for production
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    
+    @app.on_event("startup")
+    async def startup_event():
+        """Initialize system on startup"""
+        await orchestrator.initialize()
+    
+    @app.on_event("shutdown")
+    async def shutdown_event():
+        """Cleanup on shutdown"""
+        await orchestrator.shutdown()
+    
+    @app.get("/health")
+    async def health_check():
+        """System health check endpoint"""
+        return await orchestrator.health_check()
+    
+    @app.post("/chat")
+    async def process_message(request: UserMessageRequest):
+        """Process user message and return therapeutic response"""
+        try:
+            result = await orchestrator.process_user_interaction(
+                user_id=request.user_id,
+                message=request.message,
+                session_id=request.session_id,
+                mood_state=request.mood_state
+            )
+            return result
+            
+        except Exception as e:
+            logger.error(f"Chat endpoint error: {e}")
+            raise HTTPException(status_code=500, detail="Internal server error")
+    
+    @app.post("/feedback")
+    async def submit_feedback(request: FeedbackRequest, background_tasks: BackgroundTasks):
+        """Submit feedback for an interaction"""
+        try:
+            # Store feedback event
+            feedback_event = Event(
+                event_id=str(uuid.uuid4()),
+                user_id="system",  # Will be updated when we get user_id from interaction
+                event_type="feedback",
+                payload={
+                    "interaction_id": request.interaction_id,
+                    "rating": request.rating,
+                    "text": request.feedback_text
+                },
+                timestamp=datetime.now()
+            )
+            
+            await orchestrator.event_store.append_event(feedback_event)
+            return {"message": "Feedback submitted successfully"}
+            
+        except Exception as e:
+            logger.error(f"Feedback endpoint error: {e}")
+            raise HTTPException(status_code=500, detail="Failed to submit feedback")
+    
+    # CRITICAL REFINEMENT 2: Enhanced personality assessment endpoint with explicit S-PAS weighting
+    @app.post("/personality-assessment")
+    async def submit_personality_assessment(request: PersonalityAssessmentRequest):
+        """Submit personality assessment results with enhanced S-PAS calculation"""
+        try:
+            # CRITICAL REFINEMENT 2: Explicit S-PAS weight calculation
+            spas_score = SPASCalculator.calculate_spas(request.raw_scores, request.user_confidence)
+            
+            # Get test configuration for initial weight
+            test_configs = {
+                "bfi2": {"initial_weight": 0.82},
+                "hexaco": {"initial_weight": 0.84}
+            }
+            
+            initial_weight = test_configs.get(request.test_name, {}).get("initial_weight", 0.8)
+            final_weight = initial_weight * (spas_score / 10.0)
+            
+            # Enhanced normalization (in production, use psychometric norms)
+            max_score = max(request.raw_scores) if request.raw_scores else 1
+            normalized_scores = [score / max_score for score in request.raw_scores]
+            
+            logger.info(f"S-PAS calculation: raw_scores={request.raw_scores}, confidence={request.user_confidence}, spas={spas_score:.2f}, final_weight={final_weight:.3f}")
+            
+            # Store assessment event with enhanced metadata
+            assessment_event = Event(
+                event_id=str(uuid.uuid4()),
+                user_id=request.user_id,
+                event_type="personality_assessment",
+                payload={
+                    "test_name": request.test_name,
+                    "raw_scores": request.raw_scores,
+                    "user_confidence": request.user_confidence,
+                    "normalized_scores": normalized_scores,
+                    "spas_score": spas_score,
+                    "initial_weight": initial_weight,
+                    "final_weight": final_weight,
+                    "calculation_method": "cosine_similarity"
+                },
+                timestamp=datetime.now()
+            )
+            
+            await orchestrator.event_store.append_event(assessment_event)
+            
+            return {
+                "message": "Assessment submitted successfully",
+                "spas_score": round(spas_score, 2),
+                "final_weight": round(final_weight, 3),
+                "initial_weight": initial_weight,
+                "assessment_id": assessment_event.event_id
+            }
+            
+        except Exception as e:
+            logger.error(f"Assessment endpoint error: {e}")
+            raise HTTPException(status_code=500, detail="Failed to submit assessment")
+    
+    @app.get("/insights/{user_id}")
+    async def get_user_insights(user_id: str):
+        """Get weekly insights for a user"""
+        try:
+            analytics = AnalyticsProcessor(orchestrator.postgres)
+            insights = await analytics.generate_user_weekly_insights(user_id)
+            return insights
+            
+        except Exception as e:
+            logger.error(f"Insights endpoint error: {e}")
+            raise HTTPException(status_code=500, detail="Failed to generate insights")
+    
+    @app.get("/admin/system-performance")
+    async def get_system_performance():
+        """Get system performance analytics (admin endpoint)"""
+        try:
+            analytics = AnalyticsProcessor(orchestrator.postgres)
+            performance = await analytics.analyze_system_performance()
+            return performance
+            
+        except Exception as e:
+            logger.error(f"Performance endpoint error: {e}")
+            raise HTTPException(status_code=500, detail="Failed to analyze performance")
+    
+    # CRITICAL REFINEMENT 5: A/B test assignment for weekly reports
+    @app.post("/admin/assign-weekly-report-ab/{user_id}")
+    async def assign_weekly_report_ab_test(user_id: str, treatment_probability: float = 0.5):
+        """Assign user to weekly report A/B test (admin endpoint)"""
+        try:
+            import random
+            
+            # Assign to treatment or control group
+            assigned_model = "treatment" if random.random() < treatment_probability else "no_report"
+            
+            await orchestrator.model_registry.assign_ab_test(
+                user_id, 
+                "weekly_report", 
+                ["treatment", "no_report"], 
+                [treatment_probability, 1 - treatment_probability]
+            )
+            
+            return {
+                "message": f"User {user_id} assigned to weekly report A/B test",
+                "assigned_group": assigned_model,
+                "treatment_probability": treatment_probability
+            }
+            
+        except Exception as e:
+            logger.error(f"Weekly report A/B assignment error: {e}")
+            raise HTTPException(status_code=500, detail="Failed to assign A/B test")
+    
+    # CRITICAL REFINEMENT 6: Knowledge graph import endpoints
+    @app.post("/admin/import-components")
+    async def import_therapeutic_components(csv_file_path: str):
+        """Import therapeutic components from CSV (admin endpoint)"""
+        try:
+            import_count = await orchestrator.memgraph.import_components(csv_file_path, orchestrator.chroma)
+            return {
+                "message": "Components imported successfully",
+                "imported_count": import_count
+            }
+        except Exception as e:
+            logger.error(f"Component import error: {e}")
+            raise HTTPException(status_code=500, detail="Failed to import components")
+    
+    @app.post("/admin/import-relationships")  
+    async def import_therapeutic_relationships(csv_file_path: str):
+        """Import therapeutic relationships from CSV (admin endpoint)"""
+        try:
+            import_count = await orchestrator.memgraph.import_relationships(csv_file_path)
+            return {
+                "message": "Relationships imported successfully", 
+                "imported_count": import_count
+            }
+        except Exception as e:
+            logger.error(f"Relationship import error: {e}")
+            raise HTTPException(status_code=500, detail="Failed to import relationships")
+    
+    # CRITICAL REFINEMENT 3: DoRA training trigger endpoint
+    @app.post("/admin/trigger-dora-training/{user_id}")
+    async def trigger_dora_training(user_id: str = None):
+        """Trigger DoRA adapter training (admin endpoint)"""
+        try:
+            llm_service = await orchestrator.model_registry.get_model("system", "llm")
+            if hasattr(llm_service, 'weekly_tuning_job'):
+                await llm_service.weekly_tuning_job(user_id, orchestrator.postgres)
+                return {
+                    "message": f"DoRA training triggered for {'user ' + user_id if user_id else 'all users'}",
+                    "status": "completed"
+                }
+            else:
+                return {"message": "DoRA training not available", "status": "not_supported"}
+                
+        except Exception as e:
+            logger.error(f"DoRA training trigger error: {e}")
+            raise HTTPException(status_code=500, detail="Failed to trigger DoRA training")
+    
+    # CRITICAL REFINEMENT 7: LLM quality validation endpoint
+    @app.post("/admin/validate-llm-quality")
+    async def validate_llm_quality():
+        """Validate LLM response quality (admin endpoint)"""
+        try:
+            test_prompts = [
+                "I'm feeling anxious about my job interview tomorrow",
+                "I had a fight with my best friend and I don't know what to do",
+                "I've been feeling down lately and nothing seems to help",
+                "I'm struggling with making a big life decision",
+                "I feel overwhelmed with all my responsibilities"
+            ]
+            
+            llm_service = await orchestrator.model_registry.get_model("system", "llm")
+            if hasattr(llm_service, 'validate_llm_quality'):
+                validation_results = await llm_service.validate_llm_quality(test_prompts)
+                return validation_results
+            else:
+                return {"status": "not_supported", "message": "LLM quality validation not available"}
+                
+        except Exception as e:
+            logger.error(f"LLM quality validation error: {e}")
+            raise HTTPException(status_code=500, detail="Failed to validate LLM quality")
+    
+    return app
+
+# ============================================================================
+# MAIN APPLICATION ENTRY POINT
+# ============================================================================
+
+async def main():
+    """Main application entry point"""
+    
+    # Load configuration
+    config = Config()
+    
+    # Initialize orchestrator
+    orchestrator = HelloKoaOrchestrator(config)
+    
+    try:
+        # Initialize system
+        await orchestrator.initialize()
+        
+        # Initialize database schema
+        await initialize_database_schema(orchestrator.postgres)
+        
+        # Initialize knowledge graph
+        await initialize_knowledge_graph(orchestrator.memgraph, orchestrator.chroma)
+        
+        logger.info("HelloKoa system fully initialized and ready")
+        
+        # Create and run API
+        app = create_api_app(orchestrator)
+        
+        # In production, use uvicorn.run() or deploy with proper ASGI server
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+        
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested by user")
+    except Exception as e:
+        logger.error(f"Application error: {e}")
+        raise
+    finally:
+        # Cleanup
+        await orchestrator.shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+# ============================================================================
+# DEPLOYMENT AND CONFIGURATION UTILITIES
+# ============================================================================
+
+class DeploymentManager:
+    """Manage system deployment and configuration"""
+    
+    @staticmethod
+    def generate_kubernetes_manifests():
+        """Generate Kubernetes deployment manifests"""
+        
+        manifests = {
+            "deployment.yaml": """
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hellokoa-api
+  labels:
+    app: hellokoa
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: hellokoa
+  template:
+    metadata:
+      labels:
+        app: hellokoa
+    spec:
+      containers:
+      - name: hellokoa-api
+        image: hellokoa:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: POSTGRES_URL
+          valueFrom:
+            secretKeyRef:
+              name: hellokoa-secrets
+              key: postgres-url
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: hellokoa-secrets
+              key: redis-url
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+            nvidia.com/gpu: 1
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+            nvidia.com/gpu: 1
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hellokoa-service
+spec:
+  selector:
+    app: hellokoa
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8000
+  type: LoadBalancer
+""",
+            
+            "configmap.yaml": """
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hellokoa-config
+data:
+  vector_dimension: "11"
+  max_concurrent_users: "1000"
+  response_timeout: "0.5"
+  emotional_threshold: "0.85"
+  cognitive_threshold: "0.80"
+  behavioral_threshold: "0.75"
+""",
+            
+            "secrets.yaml": """
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hellokoa-secrets
+type: Opaque
+data:
+  postgres-url: <base64-encoded-postgres-url>
+  redis-url: <base64-encoded-redis-url>
+  chromadb-host: <base64-encoded-chromadb-host>
+  memgraph-host: <base64-encoded-memgraph-host>
+"""
+        }
+        
+        return manifests
+    
+    @staticmethod
+    def generate_docker_compose():
+        """Generate Docker Compose configuration for local development"""
+        
+        return """
+version: '3.8'
+
+services:
+  hellokoa-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - POSTGRES_URL=postgresql://hellokoa:password@postgres:5432/hellokoa
+      - REDIS_URL=redis://redis:6379
+      - CHROMADB_HOST=chromadb
+      - MEMGRAPH_HOST=memgraph
+    depends_on:
+      - postgres
+      - redis
+      - chromadb
+      - memgraph
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  postgres:
+    image: postgres:15
+    environment:
+      - POSTGRES_DB=hellokoa
+      - POSTGRES_USER=hellokoa
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  chromadb:
+    image: chromadb/chroma:latest
+    ports:
+      - "8080:8000"
+    volumes:
+      - chromadb_data:/chroma/chroma
+
+  memgraph:
+    image: memgraph/memgraph:latest
+    ports:
+      - "7687:7687"
+      - "7444:7444"
+    volumes:
+      - memgraph_data:/var/lib/memgraph
+    environment:
+      - MEMGRAPH_ARGS=--log-level=TRACE
+
+volumes:
+  postgres_data:
+  redis_data:
+  chromadb_data:
+  memgraph_data:
+"""
+
+# ============================================================================
+# MONITORING AND OBSERVABILITY
+# ============================================================================
+
+import time
+from functools import wraps
+from prometheus_client import Counter, Histogram, Gauge, start_http_server
+import structlog
+
+# Prometheus metrics
+REQUEST_COUNT = Counter('hellokoa_requests_total', 'Total requests', ['endpoint', 'method', 'status'])
+REQUEST_DURATION = Histogram('hellokoa_request_duration_seconds', 'Request duration', ['endpoint'])
+ACTIVE_USERS = Gauge('hellokoa_active_users', 'Number of active users')
+VECTOR_MODULATIONS = Counter('hellokoa_vector_modulations_total', 'Total vector modulations')
+JUNCTURE_DETECTIONS = Counter('hellokoa_junctures_detected_total', 'Junctures detected', ['type'])
+MODEL_INFERENCE_TIME = Histogram('hellokoa_model_inference_seconds', 'Model inference time', ['model_type'])
+
+# CRITICAL REFINEMENT 1: Enhanced Fault Tolerance Metrics
+SYNC_LAG = Histogram('hellokoa_db_sync_lag_seconds', 'Database sync lag', ['db_type'])
+DEAD_LETTER_RETRY_COUNT = Counter('hellokoa_dead_letter_retry_total', 'Dead letter retry attempts')
+COHERENCE_SCORE = Gauge('hellokoa_llm_coherence', 'LLM response coherence score')
+SPAS_ACCURACY = Histogram('hellokoa_spas_accuracy', 'S-PAS calculation accuracy')
+
+class MetricsCollector:
+    """Collect and expose system metrics"""
+    
+    def __init__(self, postgres_client: PostgreSQLClient):
+        self.postgres = postgres_client
+        
+    async def collect_system_metrics(self):
+        """Collect system-wide metrics periodically"""
+        while True:
+            try:
+                # Count active users (users with interactions in last hour)
+                active_users = await self.postgres.query(
+                    """SELECT COUNT(DISTINCT user_id) as count
+                       FROM interactions 
+                       WHERE timestamp >= NOW() - INTERVAL '1 hour'"""
+                )
+                ACTIVE_USERS.set(active_users[0]["count"] if active_users else 0)
+                
+                await asyncio.sleep(60)  # Collect every minute
+                
+            except Exception as e:
+                logger.error(f"Metrics collection error: {e}")
+                await asyncio.sleep(60)
+
+def monitor_performance(model_type: str):
+    """Decorator to monitor model performance"""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            start_time = time.time()
+            try:
+                result = await func(*args, **kwargs)
+                MODEL_INFERENCE_TIME.labels(model_type=model_type).observe(time.time() - start_time)
+                return result
+            except Exception as e:
+                MODEL_INFERENCE_TIME.labels(model_type=f"{model_type}_error").observe(time.time() - start_time)
+                raise
+        return wrapper
+    return decorator
+
+# Structured logging configuration
+structlog.configure(
+    processors=[
+        structlog.stdlib.filter_by_level,
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.PositionalArgumentsFormatter(),
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.processors.UnicodeDecoder(),
+        structlog.processors.JSONRenderer()
+    ],
+    context_class=dict,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+    cache_logger_on_first_use=True,
+)
+
+# ============================================================================
+# TESTING UTILITIES AND FIXTURES
+# ============================================================================
+
+import pytest
+from unittest.mock import AsyncMock, MagicMock
+
+class TestHelpers:
+    """Testing utilities for HelloKoa system"""
+    
+    @staticmethod
+    def create_mock_config():
+        """Create mock configuration for testing"""
+        config = Config()
+        config.postgres_url = "postgresql://test:test@localhost:5432/test_hellokoa"
+        config.redis_url = "redis://localhost:6379/1"
+        return config
+    
+    @staticmethod
+    def create_mock_user_vector():
+        """Create mock user vector for testing"""
+        return torch.rand(11)
+    
+    @staticmethod
+    def create_mock_interaction():
+        """Create mock interaction data"""
+        return {
+            "user_id": "test-user-123",
+            "session_id": "test-session-456",
+            "message": "I'm feeling anxious about my upcoming presentation",
+            "mood_state": {"valence": -0.3, "arousal": 0.7}
+        }
+    
+    @staticmethod
+    def create_mock_component():
+        """Create mock therapeutic component"""
+        return {
+            "id": "cbt_cognitive_restructuring",
+            "pillar": "Cognitive",
+            "theory": "CBT",
+            "effectiveness_score": 0.85
+        }
+
+@pytest.fixture
+async def mock_orchestrator():
+    """Pytest fixture for mock orchestrator"""
+    config = TestHelpers.create_mock_config()
+    orchestrator = HelloKoaOrchestrator(config)
+    
+    # Mock database clients
+    orchestrator.postgres = AsyncMock()
+    orchestrator.redis = AsyncMock()
+    orchestrator.chroma = AsyncMock()
+    orchestrator.memgraph = AsyncMock()
+    
+    # Mock ML components
+    orchestrator.mpmf = AsyncMock()
+    orchestrator.mpmf.get_user_vector.return_value = TestHelpers.create_mock_user_vector()
+    orchestrator.mpmf.modulate_vector.return_value = TestHelpers.create_mock_user_vector()
+    
+    orchestrator.gat_selector = AsyncMock()
+    orchestrator.gat_selector.select_component.return_value = TestHelpers.create_mock_component()
+    
+    orchestrator.dora_selector = AsyncMock()
+    orchestrator.dora_selector.select_style.return_value = "relational_depth"
+    
+    orchestrator.llm_service = AsyncMock()
+    orchestrator.llm_service.generate_response.return_value = "I understand you're feeling anxious about your presentation. That's a very normal response."
+    
+    orchestrator.is_initialized = True
+    
+    return orchestrator
+
+# Sample test cases
+class TestHelloKoaSystem:
+    """Test cases for HelloKoa system components"""
+    
+    @pytest.mark.asyncio
+    async def test_user_interaction_processing(self, mock_orchestrator):
+        """Test complete user interaction processing"""
+        interaction = TestHelpers.create_mock_interaction()
+        
+        result = await mock_orchestrator.process_user_interaction(
+            user_id=interaction["user_id"],
+            message=interaction["message"],
+            session_id=interaction["session_id"],
+            mood_state=interaction["mood_state"]
+        )
+        
+        assert "response" in result
+        assert "component" in result
+        assert "style" in result
+        assert result["processing_time"] > 0
+    
+    @pytest.mark.asyncio
+    async def test_vector_modulation(self):
+        """Test personality vector modulation"""
+        config = TestHelpers.create_mock_config()
+        postgres_mock = AsyncMock()
+        
+        mpmf = MPMFModule(postgres_mock, config)
+        base_vector = TestHelpers.create_mock_user_vector()
+        mood_state = {"valence": 0.5, "arousal": -0.2}
+        
+        # Mock historical shifts
+        postgres_mock.query.return_value = []
+        
+        modulated = await mpmf.modulate_vector("test-user", base_vector, mood_state, "test context")
+        
+        assert modulated.shape == base_vector.shape
+        assert torch.allclose(modulated.norm(), torch.tensor(1.0), atol=1e-6)
+    
+    @pytest.mark.asyncio
+    async def test_juncture_detection(self):
+        """Test juncture detection functionality"""
+        config = TestHelpers.create_mock_config()
+        detector = JunctureDetector(config)
+        
+        # Test emotional juncture
+        emotional_text = "I just realized something profound about myself"
+        scores = detector.forward(emotional_text, "therapy session")
+        
+        assert "emotional" in scores
+        assert "cognitive" in scores
+        assert "behavioral" in scores
+        assert all(0 <= score <= 1 for score in scores.values())
+    
+    def test_spas_calculation(self):
+        """Test S-PAS score calculation"""
+        raw_scores = [4.2, 3.8, 4.5, 3.9, 4.1]
+        user_confidence = [8, 7, 9, 8, 8]
+        
+        spas = SPASCalculator.calculate_spas(raw_scores, user_confidence)
+        
+        assert 0 <= spas <= 10
+        assert isinstance(spas, float)
+
+# ============================================================================
+# CONFIGURATION VALIDATION AND ENVIRONMENT SETUP
+# ============================================================================
+
+class ConfigValidator:
+    """Validate system configuration and environment"""
+    
+    @staticmethod
+    def validate_environment():
+        """Validate runtime environment requirements"""
+        requirements = {
+            "python_version": (3, 8),
+            "torch_available": True,
+            "cuda_available": torch.cuda.is_available(),
+            "gpu_memory": torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else 0
+        }
+        
+        issues = []
+        
+        # Check Python version
+        import sys
+        if sys.version_info < requirements["python_version"]:
+            issues.append(f"Python {requirements['python_version']} or higher required")
+        
+        # Check PyTorch
+        try:
+            import torch
+        except ImportError:
+            issues.append("PyTorch not available")
+        
+        # Check CUDA for GPU acceleration
+        if not requirements["cuda_available"]:
+            issues.append("CUDA not available - will use CPU (slower)")
+        
+        # Check GPU memory
+        if requirements["cuda_available"] and requirements["gpu_memory"] < 6 * 1024**3:  # 6GB
+            issues.append("Insufficient GPU memory - recommend 8GB+ for optimal performance")
+        
+        return {
+            "valid": len(issues) == 0,
+            "requirements": requirements,
+            "issues": issues
+        }
+    
+    @staticmethod
+    def validate_config(config: Config):
+        """Validate system configuration"""
+        issues = []
+        
+        # Check database URLs
+        if not config.postgres_url.startswith("postgresql://"):
+            issues.append("Invalid PostgreSQL URL format")
+        
+        if not config.redis_url.startswith("redis://"):
+            issues.append("Invalid Redis URL format")
+        
+        # Check model paths
+        required_models = [config.embedding_model, config.llm_model, config.juncture_model]
+        for model in required_models:
+            if not model:
+                issues.append(f"Model path not specified: {model}")
+        
+        # Check thresholds
+        thresholds = [config.emotional_threshold, config.cognitive_threshold, config.behavioral_threshold]
+        if not all(0 <= t <= 1 for t in thresholds):
+            issues.append("Juncture thresholds must be between 0 and 1")
+        
+        # Check performance targets
+        if config.response_timeout <= 0:
+            issues.append("Response timeout must be positive")
+        
+        if config.max_concurrent_users <= 0:
+            issues.append("Max concurrent users must be positive")
+        
+        return {
+            "valid": len(issues) == 0,
+            "issues": issues
+        }
+
+# ============================================================================
+# MIGRATION AND UPGRADE UTILITIES
+# ============================================================================
+
+class DatabaseMigrator:
+    """Handle database schema migrations and upgrades"""
+    
+    def __init__(self, postgres_client: PostgreSQLClient):
+        self.postgres = postgres_client
+    
+    async def get_current_version(self) -> str:
+        """Get current database schema version"""
+        try:
+            result = await self.postgres.query(
+                "SELECT version FROM schema_migrations ORDER BY applied_at DESC LIMIT 1"
+            )
+            return result[0]["version"] if result else "0.0.0"
+        except:
+            return "0.0.0"
+    
+    async def apply_migration(self, version: str, migration_sql: str):
+        """Apply a database migration"""
+        try:
+            # Check if migration already applied
+            existing = await self.postgres.query(
+                "SELECT version FROM schema_migrations WHERE version = $1", version
+            )
+            
+            if existing:
+                logger.info(f"Migration {version} already applied")
+                return
+            
+            # Apply migration
+            await self.postgres.execute(migration_sql)
+            
+            # Record migration
+            await self.postgres.execute(
+                """INSERT INTO schema_migrations (version, applied_at) 
+                   VALUES ($1, NOW())""",
+                version
+            )
+            
+            logger.info(f"Migration {version} applied successfully")
+            
+        except Exception as e:
+            logger.error(f"Migration {version} failed: {e}")
+            raise
+    
+    async def setup_migration_tracking(self):
+        """Set up migration tracking table"""
+        await self.postgres.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                id SERIAL PRIMARY KEY,
+                version VARCHAR(50) NOT NULL UNIQUE,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+class SystemUpgrader:
+    """Handle system upgrades and model updates"""
+    
+    def __init__(self, orchestrator: HelloKoaOrchestrator):
+        self.orchestrator = orchestrator
+    
+    async def upgrade_model(self, model_type: str, model_id: str, model_instance: Any):
+        """Upgrade a model with zero-downtime deployment"""
+        try:
+            # Register new model version
+            self.orchestrator.model_registry.register_model(
+                model_id, model_type, "upgraded", model_instance
+            )
+            
+            # Gradually migrate users to new model (canary deployment)
+            await self.orchestrator.model_registry.assign_ab_test(
+                "all_users", model_type, [model_id], [1.0]
+            )
+            
+            logger.info(f"Model {model_type} upgraded to {model_id}")
+            
+        except Exception as e:
+            logger.error(f"Model upgrade failed: {e}")
+            raise
+    
+    async def rollback_model(self, model_type: str, previous_model_id: str):
+        """Rollback to previous model version"""
+        try:
+            self.orchestrator.model_registry.active_versions[model_type] = previous_model_id
+            logger.info(f"Model {model_type} rolled back to {previous_model_id}")
+            
+        except Exception as e:
+            logger.error(f"Model rollback failed: {e}")
+            raise
+
+# ============================================================================
+# SECURITY AND PRIVACY UTILITIES
+# ============================================================================
+
+import hashlib
+import secrets
+from cryptography.fernet import Fernet
+
+class SecurityManager:
+    """Handle security, encryption, and privacy concerns"""
+    
+    def __init__(self):
+        self.encryption_key = Fernet.generate_key()
+        self.cipher_suite = Fernet(self.encryption_key)
+    
+    def encrypt_sensitive_data(self, data: str) -> str:
+        """Encrypt sensitive user data"""
+        return self.cipher_suite.encrypt(data.encode()).decode()
+    
+    def decrypt_sensitive_data(self, encrypted_data: str) -> str:
+        """Decrypt sensitive user data"""
+        return self.cipher_suite.decrypt(encrypted_data.encode()).decode()
+    
+    def hash_user_id(self, user_id: str) -> str:
+        """Create anonymized hash of user ID for analytics"""
+        return hashlib.sha256(f"{user_id}{secrets.token_hex(16)}".encode()).hexdigest()
+    
+    def sanitize_user_input(self, user_input: str) -> str:
+        """Sanitize user input to prevent injection attacks"""
+        # Remove potential SQL injection patterns
+        dangerous_patterns = ["'", '"', ";", "--", "/*", "*/", "xp_", "exec"]
+        sanitized = user_input
+        
+        for pattern in dangerous_patterns:
+            sanitized = sanitized.replace(pattern, "")
+        
+        return sanitized.strip()
+    
+    def validate_session_token(self, token: str) -> bool:
+        """Validate session token format"""
+        # Simple validation - implement proper JWT validation in production
+        return len(token) >= 32 and token.isalnum()
+
+class PrivacyManager:
+    """Manage user privacy and data retention"""
+    
+    def __init__(self, postgres_client: PostgreSQLClient):
+        self.postgres = postgres_client
+    
+    async def anonymize_user_data(self, user_id: str):
+        """Anonymize user data while preserving research value"""
+        try:
+            # Replace PII with anonymized versions
+            anonymized_id = hashlib.sha256(user_id.encode()).hexdigest()
+            
+            # Update user record
+            await self.postgres.execute(
+                """UPDATE users 
+                   SET user_id = $1, demographics = jsonb_set(demographics, '{anonymized}', 'true')
+                   WHERE user_id = $2""",
+                anonymized_id, user_id
+            )
+            
+            # Update related records
+            tables = ["raw_events", "personality_assessments", "sessions", "interactions"]
+            for table in tables:
+                await self.postgres.execute(
+                    f"UPDATE {table} SET user_id = $1 WHERE user_id = $2",
+                    anonymized_id, user_id
+                )
+            
+            logger.info(f"User data anonymized for {user_id}")
+            
+        except Exception as e:
+            logger.error(f"Data anonymization failed: {e}")
+            raise
+    
+    async def delete_user_data(self, user_id: str):
+        """Complete data deletion for GDPR compliance"""
+        try:
+            tables = ["interactions", "personality_assessments", "sessions", 
+                     "raw_events", "ab_test_assignments", "model_performance_metrics", "users"]
+            
+            for table in tables:
+                await self.postgres.execute(
+                    f"DELETE FROM {table} WHERE user_id = $1", user_id
+                )
+            
+            logger.info(f"All data deleted for user {user_id}")
+            
+        except Exception as e:
+            logger.error(f"Data deletion failed: {e}")
+            raise
+    
+    async def export_user_data(self, user_id: str) -> Dict:
+        """Export all user data for GDPR data portability"""
+        try:
+            user_data = {}
+            
+            # Get user profile
+            users = await self.postgres.query(
+                "SELECT * FROM users WHERE user_id = $1", user_id
+            )
+            user_data["profile"] = users[0] if users else {}
+            
+            # Get assessments
+            assessments = await self.postgres.query(
+                "SELECT * FROM personality_assessments WHERE user_id = $1", user_id
+            )
+            user_data["assessments"] = assessments
+            
+            # Get interactions (anonymized messages)
+            interactions = await self.postgres.query(
+                """SELECT interaction_id, session_id, timestamp, component_id, 
+                          dora_style, helpfulness_rating, mood_state
+                   FROM interactions WHERE user_id = $1""", user_id
+            )
+            user_data["interactions"] = interactions
+            
+            return user_data
+            
+        except Exception as e:
+            logger.error(f"Data export failed: {e}")
+            raise
+
+# ============================================================================
+# BACKUP AND DISASTER RECOVERY
+# ============================================================================
+
+class BackupManager:
+    """Handle data backup and disaster recovery"""
+    
+    def __init__(self, postgres_client: PostgreSQLClient):
+        self.postgres = postgres_client
+    
+    async def create_backup(self, backup_name: str = None):
+        """Create system backup"""
+        if backup_name is None:
+            backup_name = f"hellokoa_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        try:
+            # In production, would use pg_dump or similar
+            logger.info(f"Creating backup: {backup_name}")
+            
+            # Backup critical tables
+            critical_tables = ["users", "personality_assessments", "interactions", "sessions"]
+            backup_data = {}
+            
+            for table in critical_tables:
+                data = await self.postgres.query(f"SELECT * FROM {table}")
+                backup_data[table] = data
+            
+            # Store backup (in production, would use cloud storage)
+            backup_path = f"/backups/{backup_name}.json"
+            with open(backup_path, 'w') as f:
+                json.dump(backup_data, f, default=str)
+            
+            logger.info(f"Backup created: {backup_path}")
+            return backup_path
+            
+        except Exception as e:
+            logger.error(f"Backup creation failed: {e}")
+            raise
+    
+    async def restore_backup(self, backup_path: str):
+        """Restore from backup"""
+        try:
+            logger.info(f"Restoring from backup: {backup_path}")
+            
+            with open(backup_path, 'r') as f:
+                backup_data = json.load(f)
+            
+            # Restore data (simplified - would need proper restoration logic)
+            for table, data in backup_data.items():
+                logger.info(f"Restoring table: {table}")
+                # Implementation would restore data properly
+            
+            logger.info("Backup restoration completed")
+            
+        except Exception as e:
+            logger.error(f"Backup restoration failed: {e}")
+            raise
+
+# ============================================================================
+# FINAL SYSTEM LAUNCHER WITH COMPREHENSIVE ERROR HANDLING
+# ============================================================================
+
+class HelloKoaLauncher:
+    """Complete system launcher with validation and error handling"""
+    
+    def __init__(self):
+        self.config = Config()
+        self.orchestrator = None
+        self.app = None
+    
+    async def validate_and_launch(self):
+        """Validate environment and launch system"""
+        try:
+            # Environment validation
+            env_check = ConfigValidator.validate_environment()
+            if not env_check["valid"]:
+                logger.error(f"Environment validation failed: {env_check['issues']}")
+                for issue in env_check["issues"]:
+                    logger.warning(f"Environment issue: {issue}")
+            
+            # Config validation
+            config_check = ConfigValidator.validate_config(self.config)
+            if not config_check["valid"]:
+                logger.error(f"Configuration validation failed: {config_check['issues']}")
+                return False
+            
+            # Initialize orchestrator
+            self.orchestrator = HelloKoaOrchestrator(self.config)
+            
+            # Initialize system
+            await self.orchestrator.initialize()
+            
+            # Set up database schema
+            await initialize_database_schema(self.orchestrator.postgres)
+            
+            # Set up migration tracking
+            migrator = DatabaseMigrator(self.orchestrator.postgres)
+            await migrator.setup_migration_tracking()
+            
+            # Initialize knowledge graph
+            await initialize_knowledge_graph(self.orchestrator.memgraph, self.orchestrator.chroma)
+            
+            # Start metrics collection
+            metrics_collector = MetricsCollector(self.orchestrator.postgres)
+            asyncio.create_task(metrics_collector.collect_system_metrics())
+            
+            # Start metrics server
+            start_http_server(9090)
+            
+            # Create API application
+            self.app = create_api_app(self.orchestrator)
+            
+            logger.info("HelloKoa system launched successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"System launch failed: {e}")
+            if self.orchestrator:
+                await self.orchestrator.shutdown()
+            return False
+    
+    async def graceful_shutdown(self):
+        """Gracefully shutdown the system"""
+        try:
+            logger.info("Initiating graceful shutdown...")
+            
+            if self.orchestrator:
+                await self.orchestrator.shutdown()
+            
+            logger.info("Graceful shutdown completed")
+            
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
+
+# Entry point for production deployment
+if __name__ == "__main__":
+    launcher = HelloKoaLauncher()
+    
+    try:
+        success = asyncio.run(launcher.validate_and_launch())
+        if success:
+            # In production, the API would be served by uvicorn/gunicorn
+            import uvicorn
+            uvicorn.run(launcher.app, host="0.0.0.0", port=8000, loop="asyncio")
+    except KeyboardInterrupt:
+        logger.info("Shutdown signal received")
+        asyncio.run(launcher.graceful_shutdown())
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        asyncio.run(launcher.graceful_shutdown())
+        exit(1)

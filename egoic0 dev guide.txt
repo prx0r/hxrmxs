@@ -1,0 +1,56 @@
+HelloKoa MVP Development Roadmap: From Codebase to Beta-Ready
+The guiding principle is to move from foundational stability to core feature validation, and finally to hardening the system for its first live test.
+
+Sprint 0: Foundation & Stability (Now - 2 Weeks)
+Goal: Get the egoic0.txt codebase fully operational and establish a baseline for development. This sprint is about making the existing system stable and testable.
+
+Week 1: Environment & Data
+
+Task 1: Standardize Environment: Finalize requirements.txt. Create and document a docker-compose.yml file to run the entire stack (FastAPI, PostgreSQL, Redis, ChromaDB) with a single command.
+Task 2: Database Initialization: Run the alembic migrations (migrations/001_initial_schema.py) to create the database schema. Write a simple script to seed the users table with 5-10 test users.
+Task 3: Ingest Core Knowledge: Execute scripts/ingest_tcl.py to populate ChromaDB with the therapeutic components. Verify the data is present and queryable.
+Week 2: Testing & Verification
+
+Task 4: Unit Test Execution: Run the entire test suite in tests/ via pytest. All tests must pass. Remediate any failing tests.
+Task 5: Write API Smoke Tests: Add new tests for the primary API endpoints in src/main.py. Ensure /health returns 200 OK and /chat accepts a valid POST request.
+Task 6: Manual End-to-End Trace: Manually send a request via an API client (like Postman) and trace its full journey through the system logs. Confirm a request flows from main.py -> EventProcessor -> MultiStepReasoning -> LLMAdapter and back.
+Outcome of Sprint 0: A stable, running version of the MVP that every developer can work on. The core components are confirmed to be connected and passing data.
+
+Sprint 1: Core Process Validation (Weeks 3-4)
+Goal: Prove that the platform's unique value proposition—the DMPVN-driven, multi-step reasoning process—functions as intended.
+
+Week 3: DMPVN & Profiling
+
+Task 1: Vector Generation Analysis: In src/core/user_profile_network.py, add logging to output the final 32-dimensional user_vector.
+Task 2: Differential Profile Test: Create two distinct test users: one with high-scoring PHQ-9 (depression) assessment data, and another with high-scoring GAD-7 (anxiety) data. Generate vectors for both and verify they are mathematically different, proving the DMPVN is sensitive to input.
+Week 4: Reasoning Chain & Response Quality
+
+Task 3: Instrument the Reasoning Chain: In src/services/multi_step_reasoning.py, log the specific outputs of Need Classification and Causal Analysis.
+Task 4: "Golden Thread" Test: Using the anxious test user, send a relevant message (e.g., "I can't stop worrying about my presentation tomorrow"). Review the logs to see if the identified "need" is anxiety-related and if the final AI response is more specific than a generic "I'm here to help."
+Outcome of Sprint 1: Tangible proof that user assessment data creates a unique profile that directly influences the AI's reasoning process and final response.
+
+Sprint 2: The Learning Loop & Validation Upgrade (Weeks 5-6)
+Goal: Demonstrate a full, closed learning cycle and strengthen its credibility by upgrading the statistical validation method—a key compromise for deferring the live safety work.
+
+Week 5: Triggering the Learning Loop
+
+Task 1: Simulate Training Trigger: Create a small utility script that calls the should_start_training() method in src/core/learning_system.py and allows you to manually provide mock uncertainty and competence values to force the intrinsic reward over its threshold.
+Task 2: Run the Training Process: Execute the script to trigger the EnhancedWeightedTrainer.train() method. Verify that the system attempts to save a new model checkpoint file in models/checkpoints/.
+Week 6: Upgrading Validation & Registration
+
+Task 3: Critical Validation Upgrade: In src/core/learning_system.py, replace the ttest_rel function. Import mcnemar from statsmodels.stats.contingency_tables and use it for a more robust statistical comparison. This directly addresses the feedback and strengthens your offline process.
+Task 4: Verify Model Registration: Rerun the training process. Confirm that after the new validation step passes, the ModelRegistry is updated with a new model version. Use the A/B testing logic (assign_user_to_model) to confirm a new user can be assigned to the newly "trained" model.
+Outcome of Sprint 2: A functional, demonstrable learning loop with a more credible validation engine. You can now prove the system is designed to improve over time.
+
+Sprint 3 (Pre-Beta): The Safety Hardening Sprint (Weeks 7-8)
+Goal: Implement the critical safety features required to move from a developer MVP to a responsible live beta. This sprint is the mandatory gate before any external users interact with the platform.
+
+Week 7: Crisis Detection Overhaul
+
+Task 1: Integrate Transformer Model: This is the top priority. In src/services/safety_governor.py, replace the keyword-based detect_juncture logic. Integrate a pre-trained, distilled transformer model from Hugging Face specialized for crisis/distress classification.
+Task 2: Implement Escalation Pathways: Ensure that when the new model detects a crisis with high confidence, the system returns a hardcoded, safe crisis response and logs a high-priority SafetyAudit event.
+Week 8: Red Teaming & Final Polish
+
+Task 3: Hallucination Consistency Check: Add a simple mechanism to the SafetyGovernor: for sensitive topics, generate two responses and use the NLI model to check for contradictions between them. If they contradict, flag it for review or use a safer, templated response.
+Task 4: Dedicated Red Teaming: Schedule a full day where the entire team actively tries to break the new safety systems. Document all attempts, failures, and successes. Iterate on prompts and thresholds until the system is robust.
+Outcome of Sprint 3: The HelloKoa platform is now considered Beta-Ready. It has moved from a conceptual MVP to a system with foundational, modern safety measures in place, ready for a controlled, live pilot.

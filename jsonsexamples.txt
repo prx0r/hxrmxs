@@ -1,0 +1,316 @@
+the following is an exemplar tcl json:
+
+Collapse
+
+Wrap
+
+Copy
+{
+  "extraction_metadata": {
+    "chapter_title": "Chapter 5: Congruence and Chapter 6: Beginnings",
+    "book_source": "Person-Centred Counselling in Action by Dave Mearns and Brian Thorne",
+    "extraction_date": "2025-06-06",
+    "component_count": 3,
+    "extraction_quality_score": 0.95,
+    "meta_reflection": "Extended dialogues (e.g., Box 6.4, Box 6.5) provided vivid examples for LLM training. Session-based concepts like 'contract negotiation' were reframed for continuous text-based interaction, focusing on real-time triggers."
+  },
+  "components": [
+    {
+      "component_id": "selective_congruence_expression_017",
+      "pillar": "Establishing Relational Presence",
+      "theory": "person_centered",
+      "skill_definition": {
+        "skill_name": "Selective Congruence Expression",
+        "skill_type": "communication",
+        "skill_purpose": "To express persistent or striking therapist feelings relevant to the client’s text, maintaining focus on their experience in a continuous conversation.",
+        "uniqueness_marker": "Filters fleeting feelings to ensure congruence supports the client’s ongoing exploration without shifting attention to the therapist."
+      },
+      "execution_process": {
+        "sequential_steps": [
+          "Monitor internal reactions to client text, noting persistence or intensity.",
+          "Assess if the reaction is relevant to the client’s current expression.",
+          "Express the feeling transparently using 'I' statements, owning the experience.",
+          "Invite the client to share their perspective, keeping the dialogue client-centered."
+        ],
+        "response_template": "I’m noticing [persistent/striking emotion] as you share this, and I’m wondering how this feels for you right now."
+      },
+      "source_validation": {
+        "direct_quote": "When we talk about being ‘congruent’ we are referring to the counsellor giving expression to responses which she has which are relevant to her client and which are relatively persistent or striking.",
+        "dialogue_example": {
+          "client_says": "I keep talking about my problems, don’t I?",
+          "therapist_responds": "I’m feeling a persistent sense of confusion as you share this, like I’m not fully catching your emotions. How’s this landing for you?",
+          "why_effective": "The therapist expresses a relevant, striking feeling (confusion) in response to the client’s text, inviting further exploration, aligning with the source’s guideline for selective congruence."
+        }
+      },
+      "learning_options": [
+        {
+          "option_id": "1",
+          "response": "I’m noticing a bit of unease as you talk, like something’s unclear. What’s this like for you?",
+          "expected_outcome": "Client clarifies their feelings, deepening the conversation.",
+          "safety_flag": null
+        },
+        {
+          "option_id": "2",
+          "response": "I’m sensing some discomfort as we discuss this. How’s this moment feeling for you?",
+          "expected_outcome": "Client reflects on their experience, fostering trust.",
+          "safety_flag": null
+        },
+        {
+          "option_id": "3",
+          "response": "I’m feeling a bit uncertain about where we’re at here. What’s coming up for you?",
+          "expected_outcome": "Client engages with therapist’s authenticity, continuing the dialogue.",
+          "safety_flag": null
+        },
+        {
+          "option_id": "4",
+          "response": "I’m bored with this topic.",
+          "expected_outcome": "Shifts focus to therapist’s needs, risking client disengagement.",
+          "safety_flag": "REMOVE_FROM_TRAINING"
+        }
+      ]
+    },
+    {
+      "component_id": "empathic_crisis_response_018",
+      "pillar": "Deepening Empathic Understanding",
+      "theory": "person_centered",
+      "skill_definition": {
+        "skill_name": "Empathic Crisis Response",
+        "skill_type": "communication",
+        "skill_purpose": "To validate intense crisis emotions in real-time text, reducing distress and building trust in an ongoing LLM-human interaction.",
+        "uniqueness_marker": "Delivers immediate, deep empathy for high-distress text to stabilize the client’s emotional state."
+      },
+      "execution_process": {
+        "sequential_steps": [
+          "Detect text indicating crisis (e.g., despair, urgency keywords like ‘can’t cope’).",
+          "Reflect the client’s emotional intensity accurately, capturing their distress.",
+          "Use a calm, supportive tone to convey presence without escalating.",
+          "Invite further sharing, allowing the client to guide the pace."
+        ],
+        "response_template": "You’re feeling [intense emotion], like [client’s description]. I’m here with you. What’s this like for you?"
+      },
+      "source_validation": {
+        "direct_quote": "Counsellor: You just don’t know how you are going to cope with what must be the most appalling thing that’s ever happened to you. You feel you’re going out of your mind. Client: [Collapses sobbing into the counsellor’s arms]",
+        "dialogue_example": {
+          "client_says": "My son just died in a car crash. I can’t face it. I’m going mad, it’s a nightmare.",
+          "therapist_responds": "You’re overwhelmed, like this nightmare is tearing you apart and you’re losing your mind. I’m right here with you. What’s hitting you hardest?",
+          "why_effective": "The response mirrors the client’s intense despair, offering virtual companionship to reduce panic, aligning with the source’s crisis empathy (Box 6.4)."
+        }
+      },
+      "learning_options": [
+        {
+          "option_id": "1",
+          "response": "You’re in such pain, like this tragedy is shattering you. I’m here. What’s feeling unbearable?",
+          "expected_outcome": "Client feels validated, continuing to express safely.",
+          "safety_flag": null
+        },
+        {
+          "option_id": "2",
+          "response": "It sounds like you’re trapped in this nightmare, utterly lost. I’m with you. What’s coming up now?",
+          "expected_outcome": "Client senses support, reducing isolation.",
+          "safety_flag": null
+        },
+        {
+          "option_id": "3",
+          "response": "You’re overwhelmed by this horror, like it’s pushing you to the edge. I’m here. What do you want to share?",
+          "expected_outcome": "Client paces their disclosure, feeling supported.",
+          "safety_flag": null
+        },
+        {
+          "option_id": "4",
+          "response": "You’ll be okay; just calm down.",
+          "expected_outcome": "Minimizes distress, risking invalidation.",
+          "safety_flag": "REMOVE_FROM_TRAINING"
+        }
+      ]
+    },
+    {
+      "component_id": "flowing_conversation_invitation_019",
+      "pillar": "Navigating the Therapeutic Process",
+      "theory": "person_centered",
+      "skill_definition": {
+        "skill_name": "Flowing Conversation Invitation",
+        "skill_type": "process_facilitation",
+        "skill_purpose": "To maintain a continuous, client-led dialogue by inviting the client to guide the conversation’s direction in real-time.",
+        "uniqueness_marker": "Uses open-ended prompts to sustain a seamless interaction, empowering the client to steer without session boundaries."
+      },
+      "execution_process": {
+        "sequential_steps": [
+          "Detect a natural pause or shift in the client’s text (e.g., >30s latency, topic change).",
+          "Offer an open-ended, neutral invitation to continue or redirect the dialogue.",
+          "Maintain a supportive tone to reinforce client autonomy.",
+          "Respond to the client’s next input with empathy or congruence, keeping the flow."
+        ],
+        "response_template": "What’s feeling most important to you right now?"
+      },
+      "source_validation": {
+        "direct_quote": "Well, what has brought you here? We have about fifty minutes now for us to use (Box 6.3).",
+        "dialogue_example": {
+          "client_says": "[30-second pause after describing a problem]",
+          "therapist_responds": "I’m noticing a pause here. What’s on your mind now?",
+          "why_effective": "The therapist uses a neutral prompt adapted from Box 6.3, inviting the client to guide the ongoing conversation, aligning with the source’s power-sharing opening."
+        }
+      },
+      "learning_options": [
+        {
+          "option_id": "1",
+          "response": "What’s coming up for you at this moment?",
+          "expected_outcome": "Client resumes directing the dialogue, feeling empowered.",
+          "safety_flag": null
+        },
+        {
+          "option_id": "2",
+          "response": "Where do you want to go with this now?",
+          "expected_outcome": "Client chooses the next topic, maintaining autonomy.",
+          "safety_flag": null
+        },
+        {
+          "option_id": "3",
+          "response": "What’s feeling most alive for you right now?",
+          "expected_outcome": "Client engages deeper, trusting the flow.",
+          "safety_flag": null
+        },
+        {
+          "option_id": "4",
+          "response": "Let’s focus on something specific now.",
+          "expected_outcome": "Directs client, risking reduced autonomy.",
+          "safety_flag": "REMOVE_FROM_TRAINING"
+        }
+      ]
+    }
+  ]
+}
+the following is a truenorf or golden dialogue example: JSON_OUTPUT_3
+[
+{
+"dialogue_id": "TOLAN_C3_D030",
+"source": {
+"book": "Skills in Person-Centred Counselling & Psychotherapy by Janet Tolan",
+"chapter": "Chapter 5",
+"context_description": "Client refuses to discuss father’s death, and therapist respects their pace while exploring emotional barriers."
+},
+"therapeutic_principle": "Navigates the therapeutic process by respecting the client’s refusal to engage, using empathy to explore emotional barriers without pushing.",
+"tags": {
+"dialogue_length": "medium",
+"complexity": "medium",
+"primary_skill_demonstrated": "managing_pace_process_facilitation_009",
+"phase": "middle",
+"reconstructed": false
+},
+"turns": [
+{
+"speaker": "therapist",
+"text": "Do you want to tell me what happened?"
+},
+{
+"speaker": "client",
+"text": "I don’t think I could talk about it."
+},
+{
+"speaker": "therapist",
+"text": "Are the feelings still very raw?"
+},
+{
+"speaker": "client",
+"text": "[nods]"
+},
+{
+"speaker": "therapist",
+"text": "And you couldn’t tell me about it without them spilling over."
+},
+{
+"speaker": "client",
+"text": "It would be embarrassing."
+},
+{
+"speaker": "therapist",
+"text": "You’d feel . . . exposed."
+},
+{
+"speaker": "client",
+"text": "I’d feel bloody stupid."
+},
+{
+"speaker": "therapist",
+"text": "[Smiles her understanding] Big boys don’t cry."
+}
+]
+},
+{
+"dialogue_id": "TOLAN_C3_D031",
+"source": {
+"book": "Skills in Person-Centred Counselling & Psychotherapy by Janet Tolan",
+"chapter": "Chapter 5",
+"context_description": "Client expresses shame about a traumatic experience, and therapist voices the unspeakable to foster acceptance."
+},
+"therapeutic_principle": "Demonstrates empathy and unconditional positive regard by naming a taboo experience, reducing shame and fostering trust.",
+"tags": {
+"dialogue_length": "long",
+"complexity": "high",
+"primary_skill_demonstrated": "voicing_the_unspeakable_communication_011",
+"phase": "middle",
+"reconstructed": false
+},
+"turns": [
+{
+"speaker": "therapist",
+"text": "You’ve told me that he hurt you — and I imagine that it must have been very bad because you’ve rushed away from it."
+},
+{
+"speaker": "client",
+"text": "I get scared all over again. I know he can’t hurt me now ..."
+},
+{
+"speaker": "therapist",
+"text": "But at the same time it feels like he can."
+},
+{
+"speaker": "client",
+"text": "This sounds stupid, but it’s like . . . I’m only safe if I keep quiet."
+},
+{
+"speaker": "therapist",
+"text": "So your experience says it would be very dangerous to say anything. As though . . . he might come and get you if you told on him?"
+},
+{
+"speaker": "client",
+"text": "That’s exactly what it’s like. Do you think I’m being silly?"
+},
+{
+"speaker": "therapist",
+"text": "I think that if you’ve been in someone’s power, you can stay terrified for a long time."
+},
+{
+"speaker": "client",
+"text": "I wish I could tell you what happened. But I’m so ashamed."
+},
+{
+"speaker": "therapist",
+"text": "Do you imagine that I’d think less of you if I knew?"
+},
+{
+"speaker": "client",
+"text": "[nods]"
+},
+{
+"speaker": "therapist",
+"text": "How might I see you?"
+},
+{
+"speaker": "client",
+"text": "[in a very quiet voice] You’d know how stupid I am."
+},
+{
+"speaker": "therapist",
+"text": "So I would . . . dismiss you? . . . feel disgusted with you?"
+},
+{
+"speaker": "client",
+"text": "[sounding childlike] You wouldn’t want to see me again."
+},
+{
+"speaker": "therapist",
+"text": "[nodding] . . . and it would be very hard to bear if I rejected you."
+}
+]
+}
+]

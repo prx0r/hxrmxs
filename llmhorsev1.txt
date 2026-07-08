@@ -1,0 +1,2623 @@
+// LLM.horse Content Script: Terminal-style prompt saving with up arrow history
+
+class LLMHorseContent {
+    constructor() {
+        this.personalCommands = {};
+        this.communityPrompts = [];
+        this.promptHistory = []; // All prompts user has sent
+        this.saveMode = {
+            active: false,
+            selectedPrompts: [], // Prompts selected for saving
+            currentIndex: 0, // Current position in history
+            originalValue: '' // Original textarea value when save mode started
+        };
+        this.commandPrefix = 'h/';
+        this.suggestionPanel = null;
+        this.floatButton = null;
+        this.marketplaceModal = null;
+        this.currentTextarea = null;
+        this.selectedIndex = 0;
+        this.isVisible = false;
+        
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => this.init());
+        } else {
+            this.init();
+        }
+    }
+
+    async init() {
+        if (window.llmHorseInitialized) return;
+        window.llmHorseInitialized = true;
+        console.log('🐎 LLM.horse galloping into action...');
+
+        await this.loadPersonalCommands();
+        this.injectFloatButton();
+        this.injectMarketplaceModal();
+        this.injectSuggestionPanel();
+        this.setupEventListeners();
+        this.startPromptTracking();
+        
+        // Keep textarea reference updated
+        setInterval(() => { 
+            this.currentTextarea = this.findTextarea();
+        }, 1000);
+    }
+
+    async loadPersonalCommands() {
+        const response = await chrome.runtime.sendMessage({ type: 'GET_COMMANDS' });
+        if (response.success) {
+            this.personalCommands = response.commands || {};
+            // Add save command
+            this.personalCommands['h/save'] = {
+                name: 'Save Prompt Chain',
+                description: 'Save your recent prompts as a reusable command',
+                type: 'system'
+            };
+        }
+    }
+
+    // === PROMPT TRACKING ===
+    startPromptTracking() {
+        // Track when user sends prompts
+        document.body.addEventListener('click', (e) => {
+            if (this.isSendButton(e.target)) {
+                setTimeout(() => this.captureLastPrompt(), 100);
+            }
+        }, true);
+        
+        document.body.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey && this.isInChatInput(e.target)) {
+                setTimeout(() => this.captureLastPrompt(), 100);
+            }
+        }, true);
+    }
+
+    isSendButton(element) {
+        return element.matches('[data-testid="send-button"], button[type="submit"]') ||
+               element.closest('[data-testid="send-button"], button[type="submit"]');
+    }
+
+    isInChatInput(element) {
+        return element.matches('textarea#prompt-textarea, textarea[data-testid="chat-input"], div[contenteditable="true"]');
+    }
+
+    captureLastPrompt() {
+        const textarea = this.findTextarea();
+        if (!textarea) return;
+        
+        const value = this.getTextValue(textarea);
+        if (value.trim() && !value.startsWith(this.commandPrefix)) {
+            this.promptHistory.push({
+                text: value.trim(),
+                timestamp: Date.now(),
+                platform: this.detectPlatform()
+            });
+            
+            // Keep only last 20 prompts
+            if (this.promptHistory.length > 20) {
+                this.promptHistory = this.promptHistory.slice(-20);
+            }
+            
+            console.log('🐎 Captured prompt:', value.trim());
+        }
+    }
+
+    detectPlatform() {
+        const hostname = window.location.hostname;
+        if (hostname.includes('openai.com') || hostname.includes('chatgpt.com')) return 'ChatGPT';
+        if (hostname.includes('claude.ai')) return 'Claude';
+        if (hostname.includes('google.com')) return 'Gemini';
+        return 'Unknown';
+    }
+
+    // === SAVE MODE - TERMINAL STYLE ===
+    enterSaveMode(textarea) {
+        if (this.promptHistory.length === 0) {
+            this.showNotification('No prompts to save yet. Start a conversation first!');
+            return;
+        }
+
+        this.saveMode = {
+            active: true,
+            selectedPrompts: [],
+            currentIndex: this.promptHistory.length - 1, // Start with most recent
+            originalValue: this.getTextValue(textarea)
+        };
+
+        // Show the most recent prompt
+        this.showCurrentPromptInSaveMode(textarea);
+        this.updateSaveModeUI(textarea);
+    }
+
+    showCurrentPromptInSaveMode(textarea) {
+        const prompt = this.promptHistory[this.saveMode.currentIndex];
+        if (!prompt) return;
+        
+        this.setTextValue(textarea, prompt.text);
+        textarea.focus();
+    }
+
+    updateSaveModeUI(textarea) {
+        const currentPrompt = this.promptHistory[this.saveMode.currentIndex];
+        const selectedCount = this.saveMode.selectedPrompts.length;
+        
+        // Show save mode indicator
+        this.showSaveModeIndicator(textarea, {
+            current: this.saveMode.currentIndex + 1,
+            total: this.promptHistory.length,
+            selected: selectedCount,
+            prompt: currentPrompt?.text.substring(0, 100) + (currentPrompt?.text.length > 100 ? '...' : ''),
+            platform: currentPrompt?.platform
+        });
+    }
+
+    showSaveModeIndicator(textarea, info) {
+        // Remove existing indicator
+        const existing = document.getElementById('llmhorse-save-indicator');
+        if (existing) existing.remove();
+
+        const indicator = document.createElement('div');
+        indicator.id = 'llmhorse-save-indicator';
+        indicator.className = 'llmhorse-save-indicator';
+        indicator.innerHTML = `
+            <div class="llmhorse-save-header">
+                🐎 Save Mode - Prompt ${info.current}/${info.total} 
+                ${info.selected > 0 ? `(${info.selected} selected)` : ''}
+            </div>
+            <div class="llmhorse-save-content">
+                <div class="llmhorse-save-platform">${info.platform}</div>
+                <div class="llmhorse-save-prompt">"${info.prompt}"</div>
+            </div>
+            <div class="llmhorse-save-controls">
+                ↑/↓ Navigate • Space: Select • Enter: Save • Esc: Cancel
+            </div>
+        `;
+
+        // Position near textarea
+        const rect = textarea.getBoundingClientRect();
+        indicator.style.position = 'fixed';
+        indicator.style.top = (rect.top - 150) + 'px';
+        indicator.style.left = rect.left + 'px';
+        indicator.style.width = rect.width + 'px';
+        indicator.style.zIndex = '2147483647';
+
+        document.body.appendChild(indicator);
+    }
+
+    handleSaveModeKeydown(e, textarea) {
+        e.preventDefault();
+        e.stopPropagation();
+
+        switch(e.key) {
+            case 'ArrowUp':
+                if (this.saveMode.currentIndex > 0) {
+                    this.saveMode.currentIndex--;
+                    this.showCurrentPromptInSaveMode(textarea);
+                    this.updateSaveModeUI(textarea);
+                }
+                break;
+
+            case 'ArrowDown':
+                if (this.saveMode.currentIndex < this.promptHistory.length - 1) {
+                    this.saveMode.currentIndex++;
+                    this.showCurrentPromptInSaveMode(textarea);
+                    this.updateSaveModeUI(textarea);
+                }
+                break;
+
+            case ' ': // Spacebar to select/deselect
+                const currentPrompt = this.promptHistory[this.saveMode.currentIndex];
+                const isSelected = this.saveMode.selectedPrompts.some(p => p.text === currentPrompt.text);
+                
+                if (isSelected) {
+                    // Remove from selection
+                    this.saveMode.selectedPrompts = this.saveMode.selectedPrompts.filter(p => p.text !== currentPrompt.text);
+                } else {
+                    // Add to selection
+                    this.saveMode.selectedPrompts.push(currentPrompt);
+                }
+                this.updateSaveModeUI(textarea);
+                break;
+
+            case 'Enter':
+                this.finalizeSave(textarea);
+                break;
+
+            case 'Escape':
+                this.exitSaveMode(textarea);
+                break;
+        }
+    }
+
+    async finalizeSave(textarea) {
+        if (this.saveMode.selectedPrompts.length === 0) {
+            // If nothing selected, use current prompt
+            const currentPrompt = this.promptHistory[this.saveMode.currentIndex];
+            if (currentPrompt) {
+                this.saveMode.selectedPrompts = [currentPrompt];
+            }
+        }
+
+        if (this.saveMode.selectedPrompts.length === 0) {
+            this.showNotification('No prompts selected to save!');
+            this.exitSaveMode(textarea);
+            return;
+        }
+
+        // Show command naming dialog
+        this.showCommandNamingDialog(textarea);
+    }
+
+    showCommandNamingDialog(textarea) {
+        const dialog = document.createElement('div');
+        dialog.id = 'llmhorse-naming-dialog';
+        dialog.className = 'llmhorse-naming-dialog';
+        
+        const promptCount = this.saveMode.selectedPrompts.length;
+        const previewText = this.saveMode.selectedPrompts.map(p => 
+            p.text.substring(0, 50) + (p.text.length > 50 ? '...' : '')
+        ).join(' → ');
+
+        dialog.innerHTML = `
+            <div class="llmhorse-dialog-header">🐎 Save Command</div>
+            <div class="llmhorse-dialog-content">
+                <div class="llmhorse-dialog-preview">
+                    ${promptCount} prompt${promptCount > 1 ? 's' : ''}: ${previewText}
+                </div>
+                <div class="llmhorse-dialog-field">
+                    <label>Command name (without h/):</label>
+                    <input type="text" id="llmhorse-command-name" placeholder="financialreport" autocomplete="off">
+                </div>
+                <div class="llmhorse-dialog-field">
+                    <label>Description:</label>
+                    <input type="text" id="llmhorse-command-description" placeholder="Generate comprehensive financial analysis" autocomplete="off">
+                </div>
+            </div>
+            <div class="llmhorse-dialog-actions">
+                <button id="llmhorse-save-confirm" class="llmhorse-dialog-btn primary">Save Command</button>
+                <button id="llmhorse-save-cancel" class="llmhorse-dialog-btn">Cancel</button>
+            </div>
+        `;
+
+        // Position dialog
+        const rect = textarea.getBoundingClientRect();
+        dialog.style.position = 'fixed';
+        dialog.style.top = '50%';
+        dialog.style.left = '50%';
+        dialog.style.transform = 'translate(-50%, -50%)';
+        dialog.style.zIndex = '2147483648';
+
+        document.body.appendChild(dialog);
+
+        // Focus the name input
+        const nameInput = dialog.querySelector('#llmhorse-command-name');
+        nameInput.focus();
+
+        // Handle dialog actions
+        dialog.querySelector('#llmhorse-save-confirm').addEventListener('click', () => {
+            this.saveCommand(nameInput.value, dialog.querySelector('#llmhorse-command-description').value);
+            dialog.remove();
+            this.exitSaveMode(textarea);
+        });
+
+        dialog.querySelector('#llmhorse-save-cancel').addEventListener('click', () => {
+            dialog.remove();
+            this.exitSaveMode(textarea);
+        });
+
+        // Enter to save
+        nameInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                dialog.querySelector('#llmhorse-save-confirm').click();
+            }
+        });
+    }
+
+    async saveCommand(name, description) {
+        if (!name.trim()) {
+            this.showNotification('Command name is required!');
+            return;
+        }
+
+        const commandKey = 'h/' + name.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+        const prompts = this.saveMode.selectedPrompts.map(p => p.text);
+
+        const chainData = {
+            command: commandKey,
+            name: name.trim(),
+            prompts: prompts,
+            description: description.trim() || 'Saved command',
+            source: this.detectPlatform()
+        };
+
+        const response = await chrome.runtime.sendMessage({ 
+            type: 'SAVE_CHAIN', 
+            data: chainData 
+        });
+
+        if (response.success) {
+            this.showNotification(`🐎 Saved as ${commandKey}! Use it anywhere.`);
+            // Refresh commands
+            await this.loadPersonalCommands();
+        } else {
+            this.showNotification('❌ Failed to save: ' + (response.error || 'Unknown error'));
+        }
+    }
+
+    exitSaveMode(textarea) {
+        this.saveMode.active = false;
+        
+        // Restore original value
+        this.setTextValue(textarea, this.saveMode.originalValue);
+        
+        // Remove UI elements
+        const indicator = document.getElementById('llmhorse-save-indicator');
+        if (indicator) indicator.remove();
+        
+        const dialog = document.getElementById('llmhorse-naming-dialog');
+        if (dialog) dialog.remove();
+
+        this.saveMode = {
+            active: false,
+            selectedPrompts: [],
+            currentIndex: 0,
+            originalValue: ''
+        };
+    }
+
+    // === EVENT HANDLERS ===
+    setupEventListeners() {
+        document.body.addEventListener('input', this.handleInput.bind(this), true);
+        document.body.addEventListener('keydown', this.handleKeyDown.bind(this), true);
+        
+        chrome.runtime.onMessage.addListener((msg) => {
+            if (msg.type === 'COMMANDS_UPDATED') this.loadPersonalCommands();
+        });
+    }
+
+    handleInput(e) {
+        if (this.saveMode.active) return; // Ignore input in save mode
+        if (!e.target.isContentEditable && e.target.tagName !== 'TEXTAREA') return;
+        
+        const text = this.getTextValue(e.target);
+        if (text.startsWith(this.commandPrefix)) {
+            this.showSuggestions(text, e.target);
+        } else {
+            this.hideSuggestions();
+        }
+    }
+
+    handleKeyDown(e) {
+        // Save mode has priority
+        if (this.saveMode.active) {
+            this.handleSaveModeKeydown(e, e.target);
+            return;
+        }
+
+        // Command suggestions
+        if (!this.isVisible) return;
+        const items = this.suggestionPanel.querySelectorAll('.llmhorse-item');
+        if (items.length === 0) return;
+
+        if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            this.selectedIndex = (this.selectedIndex - 1 + items.length) % items.length;
+            this.updateSelection();
+        } else if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            this.selectedIndex = (this.selectedIndex + 1) % items.length;
+            this.updateSelection();
+        } else if (e.key === 'Enter' || e.key === 'Tab') {
+            e.preventDefault();
+            e.stopPropagation();
+            const selectedItem = items[this.selectedIndex];
+            if (selectedItem) {
+                const key = selectedItem.dataset.key;
+                this.selectCommand(key, e.target);
+            }
+        } else if (e.key === 'Escape') {
+            this.hideSuggestions();
+        }
+    }
+
+    showSuggestions(query, textarea) {
+        const matches = this.getMatchingCommands(query);
+        if (matches.length === 0) {
+            this.hideSuggestions();
+            return;
+        }
+
+        this.currentTextarea = textarea;
+        this.selectedIndex = 0;
+        this.renderSuggestions(matches);
+        this.positionSuggestions(textarea);
+        this.isVisible = true;
+    }
+
+    getMatchingCommands(query) {
+        const searchTerm = query.replace(this.commandPrefix, '').toLowerCase();
+        return Object.entries(this.personalCommands)
+            .filter(([key, cmd]) => 
+                key.toLowerCase().includes(searchTerm) || 
+                cmd.name.toLowerCase().includes(searchTerm)
+            )
+            .map(([key, cmd]) => ({ key, ...cmd }));
+    }
+
+    renderSuggestions(matches) {
+        this.suggestionPanel.innerHTML = `
+            <div class="llmhorse-suggestions-header">🐎 Commands (${matches.length})</div>
+            ${matches.map((cmd, index) => `
+                <div class="llmhorse-item ${index === 0 ? 'active' : ''}" data-key="${cmd.key}">
+                    <span class="llmhorse-key">${cmd.key}</span>
+                    <div class="llmhorse-content">
+                        <div class="llmhorse-name">${cmd.name}</div>
+                        <div class="llmhorse-description">${cmd.description}</div>
+                    </div>
+                </div>
+            `).join('')}
+        `;
+
+        // Add click handlers
+        this.suggestionPanel.querySelectorAll('.llmhorse-item').forEach(item => {
+            item.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                this.selectCommand(item.dataset.key, this.currentTextarea);
+            });
+        });
+    }
+
+    updateSelection() {
+        this.suggestionPanel.querySelectorAll('.llmhorse-item').forEach((item, index) => {
+            item.classList.toggle('active', index === this.selectedIndex);
+        });
+    }
+
+    hideSuggestions() {
+        this.suggestionPanel.style.display = 'none';
+        this.isVisible = false;
+    }
+
+    positionSuggestions(textarea) {
+        const rect = textarea.getBoundingClientRect();
+        this.suggestionPanel.style.display = 'block';
+        this.suggestionPanel.style.position = 'fixed';
+        this.suggestionPanel.style.top = (rect.bottom + 5) + 'px';
+        this.suggestionPanel.style.left = rect.left + 'px';
+        this.suggestionPanel.style.width = Math.max(300, rect.width) + 'px';
+    }
+
+    async selectCommand(key, textarea) {
+        const command = this.personalCommands[key];
+        if (!command) return;
+
+        this.hideSuggestions();
+
+        // Handle special save command
+        if (key === 'h/save') {
+            this.enterSaveMode(textarea);
+            return;
+        }
+
+        // Execute regular command
+        if (command.prompts && command.prompts.length > 0) {
+            for (let i = 0; i < command.prompts.length; i++) {
+                await this.executePrompt(command.prompts[i]);
+                if (i < command.prompts.length - 1) {
+                    await new Promise(r => setTimeout(r, 2000)); // Wait between prompts
+                }
+            }
+        }
+    }
+
+    // === UTILITIES ===
+    async executePrompt(promptText) {
+        const textarea = this.findTextarea();
+        if (!textarea) {
+            this.showNotification('Could not find chat input.');
+            return;
+        }
+
+        await this.typeText(textarea, promptText);
+        this.submitPrompt(textarea);
+    }
+
+    findTextarea() {
+        const selectors = [
+            'textarea#prompt-textarea',
+            'textarea[data-testid="chat-input"]', 
+            'div[contenteditable="true"]'
+        ];
+        
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el && el.offsetParent) return el;
+        }
+        return null;
+    }
+
+    getTextValue(el) {
+        return el.isContentEditable ? el.textContent : el.value;
+    }
+
+    setTextValue(el, text) {
+        if (el.isContentEditable) {
+            el.textContent = text;
+        } else {
+            el.value = text;
+        }
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    async typeText(el, text) {
+        this.setTextValue(el, text);
+        await new Promise(r => setTimeout(r, 50));
+    }
+
+    submitPrompt(textarea) {
+        textarea.focus();
+        const sendButton = document.querySelector('[data-testid="send-button"]') || 
+                          document.querySelector('button[type="submit"]');
+        
+        if (sendButton && !sendButton.disabled) {
+            sendButton.click();
+        } else {
+            textarea.dispatchEvent(new KeyboardEvent('keydown', { 
+                key: 'Enter', 
+                bubbles: true 
+            }));
+        }
+    }
+
+    showNotification(message) {
+        // Simple notification - you can enhance this
+        const notification = document.createElement('div');
+        notification.className = 'llmhorse-notification';
+        notification.textContent = message;
+        notification.style.cssText = `
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: var(--llm-bg-secondary, #1a1622);
+            color: var(--llm-text-primary, #e8e4f2);
+            padding: 12px 16px;
+            border-radius: 8px;
+            border: 1px solid var(--llm-border, #3a324c);
+            z-index: 2147483647;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+        `;
+        
+        document.body.appendChild(notification);
+        setTimeout(() => notification.remove(), 3000);
+    }
+
+    // === FLOAT BUTTON & MARKETPLACE (simplified) ===
+    injectFloatButton() {
+        if (document.getElementById('llmhorse-float-button')) return;
+        this.floatButton = document.createElement('div');
+        this.floatButton.id = 'llmhorse-float-button';
+        this.floatButton.innerHTML = '🐴';
+        this.floatButton.style.cssText = `
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 50px;
+            height: 50px;
+            background: linear-gradient(135deg, #8a4fff 0%, #ff7b00 100%);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            cursor: pointer;
+            z-index: 2147483645;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+            transition: transform 0.2s ease-in-out;
+            border: 2px solid rgba(255, 255, 255, 0.1);
+        `;
+        this.floatButton.addEventListener('click', () => {
+            const textarea = this.findTextarea();
+            if (textarea) this.enterSaveMode(textarea);
+        });
+        this.floatButton.addEventListener('mouseenter', () => {
+            this.floatButton.style.transform = 'scale(1.1) rotate(10deg)';
+        });
+        this.floatButton.addEventListener('mouseleave', () => {
+            this.floatButton.style.transform = 'scale(1) rotate(0deg)';
+        });
+        document.body.appendChild(this.floatButton);
+    }
+
+    injectSuggestionPanel() {
+        if (document.getElementById('llmhorse-suggestions')) return;
+        this.suggestionPanel = document.createElement('div');
+        this.suggestionPanel.id = 'llmhorse-suggestions';
+        this.suggestionPanel.className = 'llmhorse-suggestions';
+        this.suggestionPanel.style.cssText = `
+            position: fixed;
+            z-index: 2147483647;
+            background: rgba(18, 16, 22, 0.95);
+            backdrop-filter: blur(10px);
+            border: 1px solid #3a324c;
+            border-radius: 12px;
+            max-height: 320px;
+            overflow-y: auto;
+            box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: none;
+        `;
+        document.body.appendChild(this.suggestionPanel);
+    }
+
+    injectMarketplaceModal() {
+        // Simplified - just a placeholder for now
+        this.marketplaceModal = document.createElement('div');
+        this.marketplaceModal.id = 'llmhorse-marketplace-modal';
+        document.body.appendChild(this.marketplaceModal);
+    }
+}
+
+// Initialize
+new LLMHorseContent(); // LLM.horse Background Script: Handles auth, sync, and command storage
+
+importScripts('./lib/supabase.umd.js');
+const { createClient } = supabase;
+
+// === Supabase Configuration ===
+const SUPABASE_URL = 'https://dpmrcpdhvjktmrkbcxso.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRwbXJjcGRodmprdG1ya2JjeHNvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTI3ODQxODEsImV4cCI6MjA2ODM2MDE4MX0.yD7zEvV1jl0xvIOjDfECOkTzXCR8EdI1syPjdDuoJ-E';
+
+// Chrome storage adapter for Supabase
+const chromeStorageAdapter = {
+    getItem: async (key) => {
+        const data = await chrome.storage.local.get(key);
+        return data[key] ?? null;
+    },
+    setItem: async (key, value) => {
+        await chrome.storage.local.set({ [key]: value });
+    },
+    removeItem: async (key) => {
+        await chrome.storage.local.remove(key);
+    },
+};
+
+const supabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: {
+        storage: chromeStorageAdapter,
+        autoRefreshToken: true,
+        persistSession: true,
+        detectSessionInUrl: false,
+    },
+});
+
+let realtimeSubscription = null;
+
+// === Default Commands ===
+const getDefaultCommands = () => ({
+    'h/help': {
+        name: 'Help',
+        description: 'Show available personal commands and how to use LLM.horse',
+        prompts: ['List all of my available h/commands and explain how to use LLM.horse.'],
+        type: 'default'
+    },
+    'h/save': {
+        name: 'Save Prompt Chain',
+        description: 'Save your recent prompts as a reusable command',
+        prompts: [],
+        type: 'system'
+    }
+});
+
+// === Authentication ===
+async function handleLogin() {
+    try {
+        const { data, error } = await supabaseClient.auth.signInWithOAuth({
+            provider: 'google',
+            options: {
+                redirectTo: chrome.identity.getRedirectURL(),
+                queryParams: {
+                    access_type: 'offline',
+                    prompt: 'consent'
+                }
+            },
+        });
+
+        if (error) {
+            console.error('OAuth error:', error);
+            return { success: false, error: error.message };
+        }
+
+        return new Promise((resolve) => {
+            chrome.identity.launchWebAuthFlow({
+                url: data.url,
+                interactive: true
+            }, async (responseUrl) => {
+                if (chrome.runtime.lastError || !responseUrl) {
+                    console.error('Auth flow error:', chrome.runtime.lastError);
+                    return resolve({ 
+                        success: false, 
+                        error: 'Authentication cancelled or failed.' 
+                    });
+                }
+
+                try {
+                    const url = new URL(responseUrl);
+                    const hash = new URLSearchParams(url.hash.substring(1));
+                    const accessToken = hash.get('access_token');
+                    const refreshToken = hash.get('refresh_token');
+
+                    if (!accessToken || !refreshToken) {
+                        return resolve({ 
+                            success: false, 
+                            error: 'Failed to retrieve authentication tokens.' 
+                        });
+                    }
+
+                    const { error: sessionError } = await supabaseClient.auth.setSession({
+                        access_token: accessToken,
+                        refresh_token: refreshToken
+                    });
+
+                    if (sessionError) {
+                        console.error('Session error:', sessionError);
+                        return resolve({ 
+                            success: false, 
+                            error: sessionError.message 
+                        });
+                    }
+
+                    // Sync commands and setup realtime after successful login
+                    await syncCommands();
+                    await setupRealtimeSync();
+
+                    resolve({ success: true });
+                } catch (error) {
+                    console.error('Auth processing error:', error);
+                    resolve({ 
+                        success: false, 
+                        error: 'Failed to process authentication response.' 
+                    });
+                }
+            });
+        });
+    } catch (error) {
+        console.error('Login error:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+async function handleLogout() {
+    try {
+        // Clean up realtime subscription
+        if (realtimeSubscription) {
+            await supabaseClient.removeChannel(realtimeSubscription);
+            realtimeSubscription = null;
+        }
+
+        // Sign out from Supabase
+        await supabaseClient.auth.signOut();
+
+        // Reset to default commands only
+        await chrome.storage.local.set({ 
+            llmhorse_commands: getDefaultCommands() 
+        });
+
+        // Notify content scripts
+        await notifyContentScripts('COMMANDS_UPDATED');
+
+        return { success: true };
+    } catch (error) {
+        console.error('Logout error:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+async function getUser() {
+    try {
+        const { data: { session }, error } = await supabaseClient.auth.getSession();
+        if (error) throw error;
+        
+        return session ? 
+            { success: true, user: session.user } : 
+            { success: false };
+    } catch (error) {
+        console.error('Get user error:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+// === Command Management ===
+async function syncCommands() {
+    try {
+        const { data: { session }, error: sessionError } = await supabaseClient.auth.getSession();
+        if (sessionError) throw sessionError;
+        
+        if (!session) {
+            return { success: false, error: 'Not authenticated.' };
+        }
+
+        const { data: commands, error: fetchError } = await supabaseClient
+            .from('commands')
+            .select('*')
+            .eq('user_id', session.user.id)
+            .order('created_at', { ascending: false });
+
+        if (fetchError) throw fetchError;
+
+        // Convert commands to the format expected by content script
+        const userCommands = commands.reduce((acc, cmd) => {
+            const commandKey = cmd.command_slug || generateCommandKey(cmd.name);
+            
+            // Extract prompts from agents structure
+            const prompts = extractPromptsFromAgents(cmd.agents);
+            
+            acc[commandKey] = {
+                id: cmd.id,
+                name: cmd.name,
+                description: cmd.description || '',
+                prompts: prompts,
+                type: 'custom',
+                category: cmd.category || 'saved',
+                created_at: cmd.created_at
+            };
+            
+            return acc;
+        }, {});
+
+        // Combine with default commands
+        const allCommands = {
+            ...getDefaultCommands(),
+            ...userCommands
+        };
+
+        // Save to local storage
+        await chrome.storage.local.set({ llmhorse_commands: allCommands });
+
+        // Notify content scripts of update
+        await notifyContentScripts('COMMANDS_UPDATED');
+
+        console.log('🐎 Synced', commands.length, 'commands');
+        return { success: true, synced: commands.length };
+
+    } catch (error) {
+        console.error('Sync commands error:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+function generateCommandKey(name) {
+    return 'h/' + name.toLowerCase()
+        .replace(/[^a-z0-9\s]/g, '')
+        .replace(/\s+/g, '')
+        .substring(0, 20);
+}
+
+function extractPromptsFromAgents(agents) {
+    if (!agents || !agents.agent_a) return [];
+    
+    const prompts = [];
+    
+    // Add main prompt
+    if (agents.agent_a.prompt) {
+        prompts.push(agents.agent_a.prompt);
+    }
+    
+    // Add round prompts in order
+    if (agents.agent_a.rounds) {
+        const roundNumbers = Object.keys(agents.agent_a.rounds)
+            .map(r => parseInt(r))
+            .filter(r => !isNaN(r))
+            .sort((a, b) => a - b);
+            
+        for (const roundNum of roundNumbers) {
+            const round = agents.agent_a.rounds[roundNum];
+            if (round && round.prompt_addon) {
+                prompts.push(round.prompt_addon);
+            }
+        }
+    }
+    
+    return prompts;
+}
+
+async function handleSaveChain(chainData) {
+    try {
+        const { data: { session }, error: sessionError } = await supabaseClient.auth.getSession();
+        if (sessionError) throw sessionError;
+        
+        if (!session) {
+            return { success: false, error: 'Not authenticated.' };
+        }
+
+        const { command, name, prompts, description, source } = chainData;
+
+        if (!name || !prompts || prompts.length === 0) {
+            return { success: false, error: 'Name and prompts are required.' };
+        }
+
+        // Build agents structure for compatibility with existing schema
+        const agents = {
+            agent_a: {
+                prompt: prompts[0],
+                model: 'default' // You can make this configurable later
+            }
+        };
+
+        // Add additional prompts as rounds
+        if (prompts.length > 1) {
+            agents.agent_a.rounds = {};
+            prompts.slice(1).forEach((prompt, index) => {
+                agents.agent_a.rounds[index + 1] = {
+                    prompt_addon: prompt
+                };
+            });
+        }
+
+        // Generate pattern (simple a-b-c pattern for now)
+        const pattern = Array(prompts.length).fill(0).map((_, i) => 
+            String.fromCharCode(97 + i) // a, b, c, etc.
+        ).join('-');
+
+        const commandSlug = command || generateCommandKey(name);
+
+        const { data, error } = await supabaseClient
+            .from('commands')
+            .insert({
+                user_id: session.user.id,
+                name: name.trim(),
+                command_slug: commandSlug,
+                description: description || `Saved from ${source}`,
+                pattern: pattern,
+                agents: agents,
+                category: 'captured-chain'
+            })
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        console.log('🐎 Saved command:', commandSlug);
+        
+        // Trigger sync to update local storage
+        await syncCommands();
+
+        return { 
+            success: true, 
+            newCommand: data,
+            commandKey: commandSlug
+        };
+
+    } catch (error) {
+        console.error('Save chain error:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+async function deleteCommand(commandId) {
+    try {
+        const { data: { session }, error: sessionError } = await supabaseClient.auth.getSession();
+        if (sessionError) throw sessionError;
+        
+        if (!session) {
+            return { success: false, error: 'Not authenticated.' };
+        }
+
+        const { error } = await supabaseClient
+            .from('commands')
+            .delete()
+            .eq('id', commandId)
+            .eq('user_id', session.user.id);
+
+        if (error) throw error;
+
+        // Trigger sync to update local storage
+        await syncCommands();
+
+        return { success: true, message: 'Command deleted successfully.' };
+
+    } catch (error) {
+        console.error('Delete command error:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+// === Real-Time Sync ===
+async function setupRealtimeSync() {
+    try {
+        const { data: { session }, error } = await supabaseClient.auth.getSession();
+        if (error) throw error;
+        if (!session) return;
+
+        // Clean up existing subscription
+        if (realtimeSubscription) {
+            await supabaseClient.removeChannel(realtimeSubscription);
+        }
+
+        // Create new subscription
+        realtimeSubscription = supabaseClient
+            .channel('commands_changes_' + session.user.id)
+            .on('postgres_changes', {
+                event: '*',
+                schema: 'public',
+                table: 'commands',
+                filter: `user_id=eq.${session.user.id}`
+            }, async (payload) => {
+                console.log('🐎 Real-time update:', payload.eventType);
+                await syncCommands();
+                
+                // Show notification
+                try {
+                    await chrome.notifications.create({
+                        type: 'basic',
+                        iconUrl: 'icons/icon48.png',
+                        title: 'LLM.horse Synced',
+                        message: 'Your commands have been updated across devices.'
+                    });
+                } catch (notificationError) {
+                    console.log('Notification failed:', notificationError);
+                }
+            })
+            .subscribe((status) => {
+                if (status === 'SUBSCRIBED') {
+                    console.log('✅ Real-time sync is active!');
+                } else if (status === 'CHANNEL_ERROR') {
+                    console.error('❌ Real-time sync failed');
+                }
+            });
+
+    } catch (error) {
+        console.error('Setup realtime sync error:', error);
+    }
+}
+
+// === Community Prompts (placeholder for future) ===
+async function handleGetCommunityPrompts() {
+    try {
+        const { data, error } = await supabaseClient
+            .from('community_prompts')
+            .select('name, description, prompt, category')
+            .order('upvotes', { ascending: false })
+            .limit(20);
+
+        if (error) throw error;
+
+        return { success: true, prompts: data || [] };
+    } catch (error) {
+        console.error('Error fetching community prompts:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+// === Utility Functions ===
+async function notifyContentScripts(type, data = {}) {
+    try {
+        const tabs = await chrome.tabs.query({
+            url: [
+                "*://*.openai.com/*",
+                "*://*.chatgpt.com/*", 
+                "*://*.claude.ai/*",
+                "*://*.anthropic.com/*",
+                "*://*.google.com/*"
+            ]
+        });
+
+        for (const tab of tabs) {
+            try {
+                await chrome.tabs.sendMessage(tab.id, { type, ...data });
+            } catch (error) {
+                // Tab might not have content script loaded yet
+                console.warn(`Could not message tab ${tab.id}:`, error.message);
+            }
+        }
+    } catch (error) {
+        console.error('Notify content scripts error:', error);
+    }
+}
+
+// === Message Listener ===
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    // Handle async responses
+    (async () => {
+        try {
+            switch (message.type) {
+                case 'LOGIN':
+                    sendResponse(await handleLogin());
+                    break;
+
+                case 'LOGOUT':
+                    sendResponse(await handleLogout());
+                    break;
+
+                case 'GET_USER':
+                    sendResponse(await getUser());
+                    break;
+
+                case 'SYNC_COMMANDS':
+                    sendResponse(await syncCommands());
+                    break;
+
+                case 'GET_COMMANDS':
+                    const { llmhorse_commands } = await chrome.storage.local.get('llmhorse_commands');
+                    sendResponse({ 
+                        success: true, 
+                        commands: llmhorse_commands || getDefaultCommands() 
+                    });
+                    break;
+
+                case 'SAVE_CHAIN':
+                    sendResponse(await handleSaveChain(message.data));
+                    break;
+
+                case 'DELETE_COMMAND':
+                    sendResponse(await deleteCommand(message.commandId));
+                    break;
+
+                case 'GET_COMMUNITY_PROMPTS':
+                    sendResponse(await handleGetCommunityPrompts());
+                    break;
+
+                default:
+                    sendResponse({ 
+                        success: false, 
+                        error: 'Unknown message type: ' + message.type 
+                    });
+            }
+        } catch (error) {
+            console.error('Message handler error:', error);
+            sendResponse({ 
+                success: false, 
+                error: error.message 
+            });
+        }
+    })();
+
+    // Return true to indicate we'll send a response asynchronously
+    return true;
+});
+
+// === Lifecycle Hooks ===
+chrome.runtime.onStartup.addListener(async () => {
+    console.log('🐎 LLM.horse starting up...');
+    
+    try {
+        const { data: { session } } = await supabaseClient.auth.getSession();
+        if (session) {
+            await syncCommands();
+            await setupRealtimeSync();
+        }
+    } catch (error) {
+        console.error('Startup error:', error);
+    }
+});
+
+chrome.runtime.onInstalled.addListener(async () => {
+    console.log('🐎 LLM.horse installed!');
+    
+    try {
+        // Initialize with default commands if none exist
+        const { llmhorse_commands } = await chrome.storage.local.get('llmhorse_commands');
+        if (!llmhorse_commands) {
+            await chrome.storage.local.set({ 
+                llmhorse_commands: getDefaultCommands() 
+            });
+        }
+
+        // Check if user is already authenticated
+        const { data: { session } } = await supabaseClient.auth.getSession();
+        if (session) {
+            await syncCommands();
+            await setupRealtimeSync();
+        }
+    } catch (error) {
+        console.error('Installation error:', error);
+    }
+});
+
+// === Error Handling ===
+chrome.runtime.onSuspend.addListener(async () => {
+    console.log('🐎 LLM.horse suspending...');
+    
+    // Clean up realtime subscription
+    if (realtimeSubscription) {
+        try {
+            await supabaseClient.removeChannel(realtimeSubscription);
+        } catch (error) {
+            console.error('Cleanup error:', error);
+        }
+    }
+});
+
+// === Debug Functions ===
+function debugState() {
+    console.log('🐎 LLM.horse Debug State:');
+    console.log('- Realtime subscription:', !!realtimeSubscription);
+    chrome.storage.local.get(['llmhorse_commands']).then(data => {
+        console.log('- Local commands:', Object.keys(data.llmhorse_commands || {}).length);
+    });
+    supabaseClient.auth.getSession().then(({ data: { session } }) => {
+        console.log('- Authenticated:', !!session);
+        if (session) console.log('- User ID:', session.user.id);
+    });
+}
+
+// Make debug function available globally for development
+globalThis.llmhorseDebug = debugState; /* === LLM.horse Extension Styles === */
+:root {
+  --llm-bg-primary: #121016;
+  --llm-bg-secondary: #1a1622;
+  --llm-border: #3a324c;
+  --llm-text-primary: #e8e4f2;
+  --llm-text-secondary: #9a90b5;
+  --llm-accent-purple: #8a4fff;
+  --llm-accent-orange: #ff7b00;
+  --llm-accent-gradient: linear-gradient(135deg, var(--llm-accent-purple) 0%, var(--llm-accent-orange) 100%);
+  --llm-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --llm-font-mono: 'SF Mono', 'Monaco', 'Consolas', monospace;
+}
+
+/* === Command Suggestions Panel === */
+.llmhorse-suggestions {
+  position: fixed;
+  z-index: 2147483647;
+  background: rgba(18, 16, 22, 0.95);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--llm-border);
+  border-radius: 12px;
+  max-height: 320px;
+  overflow-y: auto;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+  font-family: var(--llm-font);
+  display: none;
+}
+
+.llmhorse-suggestions-header {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--llm-border);
+  font-size: 12px;
+  color: var(--llm-text-secondary);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.llmhorse-item {
+  padding: 12px 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--llm-text-primary);
+  transition: all 0.2s ease;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.llmhorse-item:last-child {
+  border-bottom: none;
+}
+
+.llmhorse-item:hover,
+.llmhorse-item.active {
+  background: var(--llm-accent-purple);
+  color: white;
+}
+
+.llmhorse-key {
+  font-family: var(--llm-font-mono);
+  font-weight: 600;
+  color: var(--llm-text-secondary);
+  min-width: 80px;
+  font-size: 13px;
+}
+
+.llmhorse-item:hover .llmhorse-key,
+.llmhorse-item.active .llmhorse-key {
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.llmhorse-content {
+  flex: 1;
+}
+
+.llmhorse-name {
+  font-weight: 500;
+  font-size: 14px;
+  margin-bottom: 2px;
+}
+
+.llmhorse-description {
+  font-size: 12px;
+  opacity: 0.7;
+  line-height: 1.3;
+}
+
+/* === Save Mode Indicator === */
+.llmhorse-save-indicator {
+  background: rgba(18, 16, 22, 0.98);
+  backdrop-filter: blur(15px);
+  border: 2px solid var(--llm-accent-purple);
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+  font-family: var(--llm-font);
+  color: var(--llm-text-primary);
+  animation: llmhorse-save-enter 0.3s ease-out;
+}
+
+@keyframes llmhorse-save-enter {
+  from {
+      opacity: 0;
+      transform: translateY(-10px) scale(0.95);
+  }
+  to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+  }
+}
+
+.llmhorse-save-header {
+  font-weight: 700;
+  font-size: 16px;
+  margin-bottom: 12px;
+  background: var(--llm-accent-gradient);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.llmhorse-save-content {
+  margin-bottom: 12px;
+}
+
+.llmhorse-save-platform {
+  font-size: 11px;
+  color: var(--llm-accent-orange);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+
+.llmhorse-save-prompt {
+  font-family: var(--llm-font-mono);
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--llm-text-secondary);
+  background: rgba(255, 255, 255, 0.05);
+  padding: 8px 12px;
+  border-radius: 6px;
+  border-left: 3px solid var(--llm-accent-purple);
+}
+
+.llmhorse-save-controls {
+  font-size: 11px;
+  color: var(--llm-text-secondary);
+  text-align: center;
+  padding: 8px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  font-family: var(--llm-font-mono);
+}
+
+/* === Command Naming Dialog === */
+.llmhorse-naming-dialog {
+  background: var(--llm-bg-primary);
+  border: 2px solid var(--llm-accent-purple);
+  border-radius: 16px;
+  box-shadow: 0 25px 75px rgba(0, 0, 0, 0.7);
+  font-family: var(--llm-font);
+  color: var(--llm-text-primary);
+  width: 450px;
+  max-width: 90vw;
+  animation: llmhorse-dialog-enter 0.3s ease-out;
+}
+
+@keyframes llmhorse-dialog-enter {
+  from {
+      opacity: 0;
+      transform: translate(-50%, -50%) scale(0.9);
+  }
+  to {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+  }
+}
+
+.llmhorse-dialog-header {
+  background: var(--llm-bg-secondary);
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--llm-border);
+  font-weight: 700;
+  font-size: 18px;
+  border-radius: 14px 14px 0 0;
+  text-align: center;
+}
+
+.llmhorse-dialog-content {
+  padding: 24px;
+}
+
+.llmhorse-dialog-preview {
+  background: rgba(138, 79, 255, 0.1);
+  border: 1px solid var(--llm-accent-purple);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 20px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--llm-text-secondary);
+}
+
+.llmhorse-dialog-field {
+  margin-bottom: 16px;
+}
+
+.llmhorse-dialog-field label {
+  display: block;
+  font-weight: 600;
+  font-size: 14px;
+  margin-bottom: 6px;
+  color: var(--llm-text-primary);
+}
+
+.llmhorse-dialog-field input {
+  width: 100%;
+  padding: 12px 16px;
+  background: var(--llm-bg-secondary);
+  border: 1px solid var(--llm-border);
+  border-radius: 8px;
+  color: var(--llm-text-primary);
+  font-family: var(--llm-font);
+  font-size: 14px;
+  transition: border-color 0.2s ease;
+}
+
+.llmhorse-dialog-field input:focus {
+  outline: none;
+  border-color: var(--llm-accent-purple);
+  box-shadow: 0 0 0 3px rgba(138, 79, 255, 0.1);
+}
+
+.llmhorse-dialog-field input::placeholder {
+  color: var(--llm-text-secondary);
+  opacity: 0.6;
+}
+
+.llmhorse-dialog-actions {
+  padding: 20px 24px;
+  border-top: 1px solid var(--llm-border);
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
+
+.llmhorse-dialog-btn {
+  padding: 10px 20px;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-family: var(--llm-font);
+}
+
+.llmhorse-dialog-btn.primary {
+  background: var(--llm-accent-gradient);
+  color: white;
+}
+
+.llmhorse-dialog-btn.primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(138, 79, 255, 0.3);
+}
+
+.llmhorse-dialog-btn:not(.primary) {
+  background: var(--llm-bg-secondary);
+  color: var(--llm-text-secondary);
+  border: 1px solid var(--llm-border);
+}
+
+.llmhorse-dialog-btn:not(.primary):hover {
+  background: var(--llm-border);
+  color: var(--llm-text-primary);
+}
+
+/* === Notifications === */
+.llmhorse-notification {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  background: var(--llm-bg-secondary);
+  color: var(--llm-text-primary);
+  padding: 16px 20px;
+  border-radius: 12px;
+  border: 1px solid var(--llm-border);
+  z-index: 2147483647;
+  font-family: var(--llm-font);
+  font-size: 14px;
+  font-weight: 500;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  animation: llmhorse-notification-enter 0.3s ease-out;
+  max-width: 350px;
+}
+
+@keyframes llmhorse-notification-enter {
+  from {
+      opacity: 0;
+      transform: translateX(100%);
+  }
+  to {
+      opacity: 1;
+      transform: translateX(0);
+  }
+}
+
+/* === Float Button === */
+#llmhorse-float-button {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  width: 56px;
+  height: 56px;
+  background: var(--llm-accent-gradient);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 28px;
+  cursor: pointer;
+  z-index: 2147483645;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  transition: all 0.2s ease-in-out;
+  border: 2px solid rgba(255, 255, 255, 0.1);
+  user-select: none;
+}
+
+#llmhorse-float-button:hover {
+  transform: scale(1.1) rotate(10deg);
+  box-shadow: 0 12px 32px rgba(138, 79, 255, 0.4);
+}
+
+#llmhorse-float-button:active {
+  transform: scale(1.05) rotate(5deg);
+}
+
+/* === Popup Styles === */
+.llmhorse-popup-body {
+  width: 380px;
+  background: var(--llm-bg-primary);
+  color: var(--llm-text-primary);
+  font-family: var(--llm-font);
+  margin: 0;
+  min-height: 450px;
+}
+
+.llmhorse-popup-header {
+  background: var(--llm-bg-secondary);
+  padding: 20px;
+  text-align: center;
+  border-bottom: 1px solid var(--llm-border);
+}
+
+.llmhorse-popup-header h1 {
+  font-size: 20px;
+  font-weight: 700;
+  margin: 0;
+  background: var(--llm-accent-gradient);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.llmhorse-popup-container {
+  padding: 16px;
+}
+
+.llmhorse-popup-btn {
+  width: 100%;
+  padding: 12px 16px;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background: var(--llm-accent-gradient);
+  color: white;
+  font-family: var(--llm-font);
+}
+
+.llmhorse-popup-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(138, 79, 255, 0.3);
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* === Scrollbar Styling === */
+.llmhorse-suggestions::-webkit-scrollbar,
+.llmhorse-naming-dialog input::-webkit-scrollbar {
+  width: 6px;
+}
+
+.llmhorse-suggestions::-webkit-scrollbar-track,
+.llmhorse-naming-dialog input::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.llmhorse-suggestions::-webkit-scrollbar-thumb,
+.llmhorse-naming-dialog input::-webkit-scrollbar-thumb {
+  background: var(--llm-border);
+  border-radius: 3px;
+}
+
+.llmhorse-suggestions::-webkit-scrollbar-thumb:hover,
+.llmhorse-naming-dialog input::-webkit-scrollbar-thumb:hover {
+  background: var(--llm-accent-purple);
+}
+
+/* === Responsive Design === */
+@media (max-width: 768px) {
+  .llmhorse-naming-dialog {
+      width: 95vw;
+      margin: 20px;
+  }
+  
+  .llmhorse-save-indicator {
+      left: 10px !important;
+      right: 10px;
+      width: auto !important;
+  }
+  
+  #llmhorse-float-button {
+      bottom: 80px; /* Avoid mobile browser UI */
+  }
+}
+
+/* === Dark Mode Compatibility === */
+@media (prefers-color-scheme: dark) {
+  :root {
+      --llm-bg-primary: #0d0b12;
+      --llm-bg-secondary: #141118;
+      --llm-border: #2a2332;
+  }
+}
+
+/* === High Contrast Mode === */
+@media (prefers-contrast: high) {
+  :root {
+      --llm-border: #6a5a7c;
+      --llm-text-secondary: #b8a8d5;
+  }
+  
+  .llmhorse-item:hover,
+  .llmhorse-item.active {
+      background: #6a4cff;
+  }
+}
+
+/* === Reduced Motion === */
+@media (prefers-reduced-motion: reduce) {
+  * {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+  }
+  
+  #llmhorse-float-button:hover {
+      transform: scale(1.05);
+  }
+} {
+  "manifest_version": 3,
+  "name": "LLM.horse",
+  "version": "2.0.0",
+  "description": "Supercharge your AI conversations. Save prompt chains with terminal-style navigation and use them everywhere with h/commands.",
+  
+  "permissions": [
+    "storage",
+    "identity",
+    "notifications",
+    "activeTab",
+    "scripting"
+  ],
+  
+  "host_permissions": [
+    "https://*.openai.com/*",
+    "https://*.chatgpt.com/*",
+    "https://*.claude.ai/*",
+    "https://*.anthropic.com/*",
+    "https://*.google.com/*",
+    "https://gemini.google.com/*"
+  ],
+  
+  "background": {
+    "service_worker": "background.js"
+  },
+  
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chat.openai.com/*",
+        "https://chatgpt.com/*",
+        "https://claude.ai/*",
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "extension-ui.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "LLM.horse Commands"
+  },
+  
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "extension-ui.css",
+        "icons/*.png"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+} <!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM.horse Commands</title>
+    <style>
+        /* === LLM.horse Popup Styles === */
+        :root {
+            --llm-bg-primary: #121016;
+            --llm-bg-secondary: #1a1622;
+            --llm-border: #3a324c;
+            --llm-text-primary: #e8e4f2;
+            --llm-text-secondary: #9a90b5;
+            --llm-accent-purple: #8a4fff;
+            --llm-accent-orange: #ff7b00;
+            --llm-accent-gradient: linear-gradient(135deg, var(--llm-accent-purple) 0%, var(--llm-accent-orange) 100%);
+            --llm-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            --llm-font-mono: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        .llmhorse-popup-body {
+            width: 400px;
+            background: var(--llm-bg-primary);
+            color: var(--llm-text-primary);
+            font-family: var(--llm-font);
+            margin: 0;
+            min-height: 500px;
+            overflow: hidden;
+        }
+
+        .llmhorse-popup-header {
+            background: var(--llm-bg-secondary);
+            padding: 24px;
+            text-align: center;
+            border-bottom: 1px solid var(--llm-border);
+            position: relative;
+        }
+
+        .llmhorse-popup-header h1 {
+            font-size: 24px;
+            font-weight: 700;
+            margin: 0;
+            background: var(--llm-accent-gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .llmhorse-popup-header .subtitle {
+            font-size: 12px;
+            color: var(--llm-text-secondary);
+            margin-top: 4px;
+            font-weight: 500;
+        }
+
+        .llmhorse-popup-container {
+            padding: 20px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .llmhorse-popup-btn {
+            width: 100%;
+            padding: 14px 20px;
+            border: none;
+            border-radius: 10px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            background: var(--llm-accent-gradient);
+            color: white;
+            font-family: var(--llm-font);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .llmhorse-popup-btn:hover:not(:disabled) {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 20px rgba(138, 79, 255, 0.3);
+        }
+
+        .llmhorse-popup-btn:active:not(:disabled) {
+            transform: translateY(0);
+        }
+
+        .llmhorse-popup-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        /* Loading state */
+        #loadingState {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--llm-text-secondary);
+        }
+
+        .loading-spinner {
+            width: 32px;
+            height: 32px;
+            border: 3px solid var(--llm-border);
+            border-top: 3px solid var(--llm-accent-purple);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 16px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* User info section */
+        .user-info {
+            background: var(--llm-bg-secondary);
+            padding: 16px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            text-align: center;
+            border: 1px solid var(--llm-border);
+        }
+
+        .user-info .user-email {
+            font-size: 14px;
+            word-break: break-all;
+            margin-bottom: 12px;
+            color: var(--llm-text-primary);
+            font-weight: 500;
+        }
+
+        .user-info .logout-btn {
+            background: var(--llm-bg-primary);
+            color: var(--llm-text-secondary);
+            padding: 8px 16px;
+            font-size: 12px;
+            border: 1px solid var(--llm-border);
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            font-family: var(--llm-font);
+        }
+
+        .user-info .logout-btn:hover {
+            background: var(--llm-border);
+            color: var(--llm-text-primary);
+        }
+
+        /* Section headers */
+        .section-header {
+            font-size: 12px;
+            text-transform: uppercase;
+            color: var(--llm-text-secondary);
+            margin-bottom: 12px;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .section-header::after {
+            content: '';
+            flex: 1;
+            height: 1px;
+            background: var(--llm-border);
+        }
+
+        /* Command list */
+        #commandList {
+            max-height: 280px;
+            overflow-y: auto;
+            border: 1px solid var(--llm-border);
+            border-radius: 10px;
+            background: var(--llm-bg-secondary);
+        }
+
+        .llmhorse-item {
+            padding: 14px 16px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            color: var(--llm-text-primary);
+            transition: all 0.2s ease;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .llmhorse-item:last-child {
+            border-bottom: none;
+        }
+
+        .llmhorse-item:hover {
+            background: rgba(138, 79, 255, 0.1);
+        }
+
+        .llmhorse-key {
+            font-family: var(--llm-font-mono);
+            font-weight: 600;
+            color: var(--llm-accent-purple);
+            min-width: 85px;
+            font-size: 12px;
+            background: rgba(138, 79, 255, 0.1);
+            padding: 4px 8px;
+            border-radius: 4px;
+        }
+
+        .llmhorse-content {
+            flex: 1;
+        }
+
+        .llmhorse-name {
+            font-weight: 500;
+            font-size: 14px;
+            margin-bottom: 2px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .llmhorse-description {
+            font-size: 12px;
+            opacity: 0.7;
+            line-height: 1.3;
+        }
+
+        .llmhorse-chain-indicator {
+            background: var(--llm-accent-orange);
+            color: white;
+            padding: 2px 6px;
+            border-radius: 10px;
+            font-size: 10px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        /* Status message */
+        #statusMessage {
+            display: none;
+        }
+
+        /* Empty state */
+        .empty-state {
+            padding: 30px 20px;
+            text-align: center;
+            color: var(--llm-text-secondary);
+            line-height: 1.5;
+        }
+
+        .empty-state strong {
+            color: var(--llm-accent-purple);
+            font-family: var(--llm-font-mono);
+        }
+
+        /* Footer */
+        .popup-footer {
+            padding: 16px 20px;
+            border-top: 1px solid var(--llm-border);
+            background: var(--llm-bg-secondary);
+            text-align: center;
+        }
+
+        .popup-footer .version {
+            font-size: 11px;
+            color: var(--llm-text-secondary);
+            opacity: 0.6;
+        }
+
+        /* Scrollbar styling */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--llm-border);
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--llm-accent-purple);
+        }
+
+        /* Responsive adjustments */
+        @media (max-height: 600px) {
+            .llmhorse-popup-container {
+                max-height: 300px;
+            }
+            
+            #commandList {
+                max-height: 200px;
+            }
+        }
+    </style>
+</head>
+<body class="llmhorse-popup-body">
+    <div class="llmhorse-popup-header">
+        <h1>🐴 LLM.horse</h1>
+        <div class="subtitle">Supercharge your AI conversations</div>
+    </div>
+
+    <div class="llmhorse-popup-container" id="popup-container">
+        <!-- Loading State -->
+        <div id="loadingState">
+            <div class="loading-spinner"></div>
+            <div>Loading your stable...</div>
+        </div>
+
+        <!-- Logged Out View -->
+        <div id="loggedOutView" class="hidden">
+            <div style="text-align: center; margin-bottom: 20px; line-height: 1.5;">
+                <p style="margin: 0 0 16px; color: var(--llm-text-secondary);">
+                    Sign in to sync your personal command library across all your devices.
+                </p>
+                <div style="font-size: 12px; color: var(--llm-text-secondary); background: rgba(255, 255, 255, 0.05); padding: 12px; border-radius: 8px; margin-bottom: 20px;">
+                    💡 <strong>How it works:</strong><br>
+                    1. Visit any AI chat (ChatGPT, Claude, Gemini)<br>
+                    2. Type <code style="background: rgba(138, 79, 255, 0.2); padding: 2px 4px; border-radius: 3px;">h/save</code> to save prompt chains<br>
+                    3. Use your saved commands anywhere with <code style="background: rgba(138, 79, 255, 0.2); padding: 2px 4px; border-radius: 3px;">h/yourcommand</code>
+                </div>
+            </div>
+            <button class="llmhorse-popup-btn" id="loginButton">
+                Sign In with Google
+            </button>
+        </div>
+
+        <!-- Logged In View -->
+        <div id="loggedInView" class="hidden">
+            <!-- Status Message -->
+            <div id="statusMessage"></div>
+
+            <!-- User Info -->
+            <div class="user-info">
+                <div class="user-email" id="userEmail"></div>
+                <button class="logout-btn" id="logoutButton">Sign Out</button>
+            </div>
+
+            <!-- Commands Section -->
+            <div class="section-header">
+                Your Commands
+            </div>
+            
+            <div id="commandList"></div>
+
+            <!-- Sync Button -->
+            <button class="llmhorse-popup-btn" id="syncButton" style="margin-top: 16px;">
+                🔄 Sync Commands
+            </button>
+
+            <!-- Quick Guide -->
+            <div style="margin-top: 16px; padding: 12px; background: rgba(255, 255, 255, 0.02); border-radius: 8px; border: 1px solid var(--llm-border);">
+                <div style="font-size: 12px; color: var(--llm-text-secondary); margin-bottom: 8px; font-weight: 600;">
+                    🚀 Quick Start
+                </div>
+                <div style="font-size: 11px; color: var(--llm-text-secondary); line-height: 1.4;">
+                    • Type <code style="background: rgba(138, 79, 255, 0.2); padding: 1px 3px; border-radius: 2px;">h/</code> in any AI chat to see your commands<br>
+                    • Use <code style="background: rgba(138, 79, 255, 0.2); padding: 1px 3px; border-radius: 2px;">h/save</code> to capture effective prompt chains<br>
+                    • Click the 🐴 button to quickly save conversations
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="popup-footer">
+        <div class="version">v2.0.0 • Made with 🐴 for AI power users</div>
+    </div>
+
+    <script src="popup.js"></script>
+</body>
+</html> // LLM.horse Popup Logic
+
+class LLMHorsePopup {
+    constructor() {
+        this.elements = {
+            loadingState: document.getElementById('loadingState'),
+            loggedOutView: document.getElementById('loggedOutView'),
+            loggedInView: document.getElementById('loggedInView'),
+            loginButton: document.getElementById('loginButton'),
+            logoutButton: document.getElementById('logoutButton'),
+            syncButton: document.getElementById('syncButton'),
+            userEmail: document.getElementById('userEmail'),
+            commandList: document.getElementById('commandList'),
+            statusMessage: document.getElementById('statusMessage'),
+        };
+        
+        document.addEventListener('DOMContentLoaded', () => this.init());
+    }
+
+    async init() {
+        console.log('🐎 Popup initializing...');
+        this.setupEventListeners();
+        await this.checkAuthState();
+    }
+
+    setupEventListeners() {
+        this.elements.loginButton?.addEventListener('click', () => this.handleLogin());
+        this.elements.logoutButton?.addEventListener('click', () => this.handleLogout());
+        this.elements.syncButton?.addEventListener('click', () => this.handleSync());
+    }
+
+    sendMessage(message) {
+        return new Promise(resolve => {
+            chrome.runtime.sendMessage(message, response => {
+                if (chrome.runtime.lastError) {
+                    console.error('Runtime error:', chrome.runtime.lastError);
+                    resolve({ 
+                        success: false, 
+                        error: 'Connection error: ' + chrome.runtime.lastError.message 
+                    });
+                } else {
+                    resolve(response || { 
+                        success: false, 
+                        error: 'No response from background script.' 
+                    });
+                }
+            });
+        });
+    }
+
+    async checkAuthState() {
+        this.showLoading();
+        
+        try {
+            const response = await this.sendMessage({ type: 'GET_USER' });
+            
+            this.hideLoading();
+            
+            if (response.success && response.user) {
+                this.renderLoggedIn(response.user);
+            } else {
+                this.renderLoggedOut();
+            }
+        } catch (error) {
+            console.error('Auth check error:', error);
+            this.hideLoading();
+            this.renderLoggedOut();
+            this.showStatus('Failed to check authentication status.', 'error');
+        }
+    }
+
+    async handleLogin() {
+        this.showStatus('Authenticating with Google...', 'info');
+        this.elements.loginButton.disabled = true;
+        this.elements.loginButton.textContent = 'Signing In...';
+        
+        try {
+            const response = await this.sendMessage({ type: 'LOGIN' });
+            
+            if (response.success) {
+                this.showStatus('🐎 Saddled up! Signed in successfully.', 'success');
+                await this.checkAuthState();
+            } else {
+                this.showStatus(response.error || 'Login failed. Please try again.', 'error');
+            }
+        } catch (error) {
+            console.error('Login error:', error);
+            this.showStatus('Login failed due to connection error.', 'error');
+        } finally {
+            this.elements.loginButton.disabled = false;
+            this.elements.loginButton.textContent = 'Sign In with Google';
+        }
+    }
+
+    async handleLogout() {
+        this.showStatus('Signing out...', 'info');
+        
+        try {
+            const response = await this.sendMessage({ type: 'LOGOUT' });
+            
+            if (response.success) {
+                this.renderLoggedOut();
+                this.showStatus('🐎 Successfully unsaddled. See you soon!', 'success');
+            } else {
+                this.showStatus(response.error || 'Logout failed.', 'error');
+            }
+        } catch (error) {
+            console.error('Logout error:', error);
+            this.showStatus('Logout failed due to connection error.', 'error');
+        }
+    }
+
+    async handleSync() {
+        this.showStatus('Syncing commands...', 'info');
+        this.elements.syncButton.disabled = true;
+        this.elements.syncButton.textContent = 'Syncing...';
+        
+        try {
+            const response = await this.sendMessage({ type: 'SYNC_COMMANDS' });
+            
+            if (response.success) {
+                this.showStatus(`🐎 Galloped through ${response.synced} commands!`, 'success');
+                await this.loadAndRenderCommands();
+            } else {
+                this.showStatus(response.error || 'Sync failed.', 'error');
+            }
+        } catch (error) {
+            console.error('Sync error:', error);
+            this.showStatus('Sync failed due to connection error.', 'error');
+        } finally {
+            this.elements.syncButton.disabled = false;
+            this.elements.syncButton.textContent = 'Sync Commands';
+        }
+    }
+
+    async handleDeleteCommand(commandId, commandName) {
+        if (!confirm(`Are you sure you want to delete "${commandName}"?\n\nThis action cannot be undone.`)) {
+            return;
+        }
+        
+        this.showStatus('Deleting command...', 'info');
+        
+        try {
+            const response = await this.sendMessage({ 
+                type: 'DELETE_COMMAND', 
+                commandId 
+            });
+            
+            if (response.success) {
+                this.showStatus(`🐎 "${commandName}" has been put out to pasture.`, 'success');
+                await this.loadAndRenderCommands();
+            } else {
+                this.showStatus(response.error || 'Failed to delete command.', 'error');
+            }
+        } catch (error) {
+            console.error('Delete error:', error);
+            this.showStatus('Delete failed due to connection error.', 'error');
+        }
+    }
+
+    showLoading() {
+        this.elements.loadingState.classList.remove('hidden');
+        this.elements.loggedOutView.classList.add('hidden');
+        this.elements.loggedInView.classList.add('hidden');
+    }
+
+    hideLoading() {
+        this.elements.loadingState.classList.add('hidden');
+    }
+
+    renderLoggedIn(user) {
+        this.elements.loggedOutView.classList.add('hidden');
+        this.elements.loggedInView.classList.remove('hidden');
+        this.elements.userEmail.textContent = user.email;
+        this.loadAndRenderCommands();
+    }
+
+    renderLoggedOut() {
+        this.elements.loggedInView.classList.add('hidden');
+        this.elements.loggedOutView.classList.remove('hidden');
+    }
+
+    async loadAndRenderCommands() {
+        try {
+            const response = await this.sendMessage({ type: 'GET_COMMANDS' });
+            
+            if (response.success && response.commands) {
+                this.renderCommandList(response.commands);
+            } else {
+                this.elements.commandList.innerHTML = `
+                    <div style="padding: 20px; text-align: center; color: var(--llm-text-secondary);">
+                        Failed to load commands.
+                    </div>
+                `;
+            }
+        } catch (error) {
+            console.error('Load commands error:', error);
+            this.elements.commandList.innerHTML = `
+                <div style="padding: 20px; text-align: center; color: var(--llm-text-secondary);">
+                    Connection error.
+                </div>
+            `;
+        }
+    }
+
+    renderCommandList(commands) {
+        const listEl = this.elements.commandList;
+        listEl.innerHTML = '';
+
+        // Sort commands: system first, then custom by name
+        const sorted = Object.entries(commands).sort((a, b) => {
+            const [aKey, aCmd] = a;
+            const [bKey, bCmd] = b;
+            
+            // System/default commands first
+            if (aCmd.type === 'system' && bCmd.type !== 'system') return -1;
+            if (bCmd.type === 'system' && aCmd.type !== 'system') return 1;
+            if (aCmd.type === 'default' && bCmd.type !== 'default') return -1;
+            if (bCmd.type === 'default' && aCmd.type !== 'default') return 1;
+            
+            // Then alphabetically
+            return aKey.localeCompare(bKey);
+        });
+
+        if (sorted.length === 0) {
+            listEl.innerHTML = `
+                <div style="padding: 20px; text-align: center; color: var(--llm-text-secondary);">
+                    Your stable is empty. 🐎<br><br>
+                    Visit any AI chat (ChatGPT, Claude, Gemini) and use <strong>h/save</strong> to start building your command library!
+                </div>
+            `;
+            return;
+        }
+
+        // Group commands by type
+        const systemCommands = sorted.filter(([, cmd]) => cmd.type === 'system' || cmd.type === 'default');
+        const customCommands = sorted.filter(([, cmd]) => cmd.type === 'custom');
+
+        // Render system commands
+        if (systemCommands.length > 0) {
+            listEl.appendChild(this.createSectionHeader('Built-in Commands'));
+            systemCommands.forEach(([key, command]) => {
+                listEl.appendChild(this.createCommandItem(key, command, false));
+            });
+        }
+
+        // Render custom commands
+        if (customCommands.length > 0) {
+            listEl.appendChild(this.createSectionHeader(`Your Commands (${customCommands.length})`));
+            customCommands.forEach(([key, command]) => {
+                listEl.appendChild(this.createCommandItem(key, command, true));
+            });
+        }
+    }
+
+    createSectionHeader(title) {
+        const header = document.createElement('div');
+        header.style.cssText = `
+            padding: 12px 16px 8px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--llm-text-secondary);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            margin-bottom: 4px;
+        `;
+        header.textContent = title;
+        return header;
+    }
+
+    createCommandItem(key, command, isDeletable) {
+        const item = document.createElement('div');
+        item.className = 'llmhorse-item';
+        
+        const promptCount = command.prompts ? command.prompts.length : 0;
+        const isChain = promptCount > 1;
+        
+        item.innerHTML = `
+            <span class="llmhorse-key">${key}</span>
+            <div class="llmhorse-content">
+                <div class="llmhorse-name">
+                    ${this.escapeHtml(command.name)}
+                    ${isChain ? `<span class="llmhorse-chain-indicator">${promptCount} steps</span>` : ''}
+                </div>
+                ${command.description ? `<div class="llmhorse-description">${this.escapeHtml(command.description)}</div>` : ''}
+            </div>
+            ${isDeletable ? `
+                <button 
+                    data-id="${command.id}" 
+                    data-name="${this.escapeHtml(command.name)}" 
+                    title="Delete command"
+                    style="
+                        background: none; 
+                        border: none; 
+                        cursor: pointer; 
+                        font-size: 16px;
+                        padding: 4px;
+                        border-radius: 4px;
+                        transition: background 0.2s ease;
+                        color: var(--llm-text-secondary);
+                    "
+                    onmouseover="this.style.background='rgba(255,107,107,0.2)'; this.style.color='#ff6b6b';"
+                    onmouseout="this.style.background='none'; this.style.color='var(--llm-text-secondary)';"
+                >🗑️</button>
+            ` : ''}
+        `;
+
+        // Add delete handler
+        if (isDeletable) {
+            const deleteBtn = item.querySelector('button');
+            deleteBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.handleDeleteCommand(
+                    e.target.dataset.id, 
+                    e.target.dataset.name
+                );
+            });
+        }
+
+        // Add click handler to show details
+        item.addEventListener('click', () => {
+            this.showCommandDetails(key, command);
+        });
+
+        return item;
+    }
+
+    showCommandDetails(key, command) {
+        const modal = document.createElement('div');
+        modal.style.cssText = `
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 10000;
+            font-family: var(--llm-font);
+        `;
+
+        const content = document.createElement('div');
+        content.style.cssText = `
+            background: var(--llm-bg-primary);
+            border: 1px solid var(--llm-border);
+            border-radius: 12px;
+            padding: 20px;
+            max-width: 90%;
+            max-height: 80%;
+            overflow-y: auto;
+            color: var(--llm-text-primary);
+        `;
+
+        const promptsHtml = command.prompts && command.prompts.length > 0 ? 
+            command.prompts.map((prompt, i) => `
+                <div style="margin-bottom: 12px;">
+                    <div style="font-size: 11px; color: var(--llm-text-secondary); margin-bottom: 4px;">
+                        STEP ${i + 1}
+                    </div>
+                    <div style="
+                        background: rgba(255, 255, 255, 0.05);
+                        padding: 8px 12px;
+                        border-radius: 6px;
+                        font-family: var(--llm-font-mono);
+                        font-size: 12px;
+                        line-height: 1.4;
+                        border-left: 3px solid var(--llm-accent-purple);
+                    ">${this.escapeHtml(prompt)}</div>
+                </div>
+            `).join('') : 
+            '<div style="color: var(--llm-text-secondary); font-style: italic;">No prompts defined</div>';
+
+        content.innerHTML = `
+            <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 16px;">
+                <div>
+                    <h3 style="margin: 0; font-size: 18px;">${this.escapeHtml(command.name)}</h3>
+                    <div style="font-family: var(--llm-font-mono); color: var(--llm-text-secondary); font-size: 13px;">${key}</div>
+                </div>
+                <button id="closeModal" style="
+                    background: none;
+                    border: none;
+                    font-size: 24px;
+                    cursor: pointer;
+                    color: var(--llm-text-secondary);
+                    padding: 0;
+                    line-height: 1;
+                ">×</button>
+            </div>
+            
+            ${command.description ? `
+                <div style="margin-bottom: 16px; color: var(--llm-text-secondary);">
+                    ${this.escapeHtml(command.description)}
+                </div>
+            ` : ''}
+            
+            <div style="margin-bottom: 12px;">
+                <h4 style="margin: 0 0 8px; font-size: 14px; color: var(--llm-text-secondary);">PROMPTS</h4>
+                ${promptsHtml}
+            </div>
+            
+            <div style="text-align: center; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--llm-border);">
+                <div style="font-size: 12px; color: var(--llm-text-secondary);">
+                    Use <strong>${key}</strong> in any AI chat to run this command
+                </div>
+            </div>
+        `;
+
+        modal.appendChild(content);
+        document.body.appendChild(modal);
+
+        // Close handlers
+        const closeBtn = content.querySelector('#closeModal');
+        closeBtn.addEventListener('click', () => modal.remove());
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) modal.remove();
+        });
+    }
+
+    showStatus(message, type = 'success') {
+        const statusEl = this.elements.statusMessage;
+        statusEl.textContent = message;
+        statusEl.className = `status-${type}`;
+        statusEl.style.cssText = `
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            margin-bottom: 12px;
+            text-align: center;
+            background: ${type === 'success' ? 'rgba(34, 197, 94, 0.1)' : 
+                         type === 'error' ? 'rgba(239, 68, 68, 0.1)' : 
+                         'rgba(59, 130, 246, 0.1)'};
+            color: ${type === 'success' ? '#22c55e' : 
+                    type === 'error' ? '#ef4444' : 
+                    '#3b82f6'};
+            border: 1px solid ${type === 'success' ? 'rgba(34, 197, 94, 0.2)' : 
+                               type === 'error' ? 'rgba(239, 68, 68, 0.2)' : 
+                               'rgba(59, 130, 246, 0.2)'};
+        `;
+        statusEl.style.display = 'block';
+        
+        // Auto-hide after 3 seconds
+        setTimeout(() => {
+            statusEl.style.display = 'none';
+        }, 3000);
+    }
+
+    escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+}
+
+// Initialize popup
+new LLMHorsePopup();

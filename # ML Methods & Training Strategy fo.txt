@@ -1,0 +1,1857 @@
+# ML Methods & Training Strategy for UGF + AI Framework
+
+## 🧠 Core ML Architecture Decision Matrix
+
+| Component | Recommended Approach | Alternative | Reasoning |
+|-----------|---------------------|-------------|-----------|
+| **Base Model** | Gemma 3 4B + LoRAs | Fine-tuned smaller models | Best balance of capability and VRAM efficiency |
+| **Visual Understanding** | Built-in multimodal | Separate vision encoder | Unified processing, lower memory |
+| **Music Generation** | Custom VAE + TensorFlow.js | MusicVAE | Specialized for our UGF format |
+| **Real-time Inference** | ONNX.js + WebGL | TensorFlow.js | Better performance for production |
+| **Training Framework** | Unsloth + PyTorch | Standard transformers | 2x faster, 70% less VRAM |
+
+## 🎵 MusicVAE vs Custom Audio ML
+
+### **Option A: Leverage MusicVAE/Magenta.js**
+
+**Pros:**
+- Pre-trained on massive music datasets
+- Proven architecture for musical creativity
+- Direct browser integration
+- MIDI output compatibility
+
+**Cons:**
+- Not optimized for our UGF audio mapping format
+- Limited real-time parameter control
+- Focused on note sequences, not parameter mappings
+
+### **Option B: Custom Audio-Visual VAE (Recommended)**
+
+```python
+# Custom VAE for UGF Audio Mappings
+class UGFAudioMappingVAE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Encoder: Audio features → Latent space
+        self.audio_encoder = nn.Sequential(
+            nn.Linear(256, 128),  # Audio features
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32)     # Latent dim
+        )
+        
+        # Decoder: Latent space → UGF mappings
+        self.mapping_decoder = nn.Sequential(
+            nn.Linear(32, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, 256)   # UGF mapping parameters
+        )
+        
+    def forward(self, audio_features):
+        latent = self.audio_encoder(audio_features)
+        mappings = self.mapping_decoder(latent)
+        return mappings, latent
+```
+
+**Why Custom is Better:**
+- Direct UGF format output
+- Real-time parameter optimization
+- Visual-audio cross-modal training
+- Specialized for generative art (not just music)
+
+## 🔧 TensorFlow.js vs Alternatives
+
+### **TensorFlow.js: Browser ML Powerhouse**
+
+**Strengths:**
+```javascript
+// Real-time model inference in browser
+const model = await tf.loadLayersModel('/models/ugf_generator.json');
+
+// GPU acceleration with WebGL
+const prediction = model.predict(inputTensor);
+
+// Memory efficient streaming
+const streamingModel = await tf.loadLayersModel('/models/streaming_model.json');
+```
+
+**Use Cases for Our Framework:**
+- Real-time creative parameter adjustment
+- Browser-based model fine-tuning
+- Client-side privacy (no server needed)
+- WebGL acceleration for visual ML
+
+### **ONNX.js: Production Alternative**
+
+**Better for:**
+- Faster inference (2-3x speedup)
+- Smaller model sizes
+- Cross-platform compatibility
+- Production deployment
+
+```javascript
+// ONNX.js example
+const session = await ort.InferenceSession.create('/models/ugf_model.onnx');
+const results = await session.run({'input': inputTensor});
+```
+
+## 🎯 LoRA Training Strategy
+
+### **Specialized LoRA Architecture**
+
+```python
+# LoRA configuration for creative styles
+lora_config = {
+    "visual_style_loras": {
+        "cosmic_nebula": {
+            "rank": 16,
+            "alpha": 32,
+            "target_modules": ["q_proj", "v_proj", "o_proj"],
+            "bias": "none"
+        },
+        "bioluminescent_forest": {
+            "rank": 8,
+            "alpha": 16,
+            "target_modules": ["q_proj", "k_proj", "v_proj"],
+            "bias": "lora_only"
+        }
+    },
+    "audio_mapping_loras": {
+        "ambient_electronic": {
+            "rank": 12,
+            "alpha": 24,
+            "target_modules": ["gate_proj", "up_proj", "down_proj"],
+            "bias": "none"
+        }
+    }
+}
+```
+
+### **LoRA Training Data Pipeline**
+
+```python
+class UGFLoRADataset:
+    def __init__(self, style_name):
+        self.style_name = style_name
+        self.examples = self.load_curated_examples()
+    
+    def load_curated_examples(self):
+        return [
+            {
+                "prompt": "mystical underwater forest with flowing particles",
+                "expected_ugf": {
+                    "systems": ["l_system", "gpu_compute_pipeline"],
+                    "parameters": {
+                        "complexity": 0.8,
+                        "energy": 0.6,
+                        "chaos": 0.3
+                    }
+                },
+                "reference_image": "underwater_forest_ref.jpg",
+                "audio_context": "ambient_flowing.wav"
+            }
+            # ... more examples
+        ]
+    
+    def __getitem__(self, idx):
+        example = self.examples[idx]
+        
+        # Multimodal tokenization
+        text_tokens = self.tokenizer(example["prompt"])
+        image_features = self.vision_encoder(example["reference_image"])
+        audio_features = self.audio_encoder(example["audio_context"])
+        
+        # Expected UGF output
+        target_ugf = json.dumps(example["expected_ugf"])
+        target_tokens = self.tokenizer(target_ugf)
+        
+        return {
+            "input_ids": text_tokens,
+            "image_features": image_features,
+            "audio_features": audio_features,
+            "labels": target_tokens
+        }
+```
+
+### **Training Loop with Unsloth**
+
+```python
+# Using Unsloth for 2x faster LoRA training
+from unsloth import FastLanguageModel
+import torch
+
+# Load base model with 4-bit quantization
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name="google/gemma-3-4b-it",
+    max_seq_length=2048,
+    dtype=None,  # Auto-detect
+    load_in_4bit=True,
+)
+
+# Add LoRA adapters
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=16,  # LoRA rank
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    lora_alpha=16,
+    lora_dropout=0.1,
+    bias="none",
+    use_gradient_checkpointing=True,
+    random_state=3407,
+)
+
+# Training configuration
+trainer = SFTTrainer(
+    model=model,
+    tokenizer=tokenizer,
+    train_dataset=ugf_dataset,
+    dataset_text_field="text",
+    max_seq_length=2048,
+    args=TrainingArguments(
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=4,
+        warmup_steps=10,
+        max_steps=100,
+        fp16=not torch.cuda.is_bf16_supported(),
+        bf16=torch.cuda.is_bf16_supported(),
+        logging_steps=1,
+        output_dir="ugf_lora_outputs",
+        optim="adamw_8bit",
+        seed=3407,
+    ),
+)
+
+# Train the LoRA
+trainer_stats = trainer.train()
+```
+
+## 🔄 Feedback & Reinforcement Learning
+
+### **Multi-Modal Feedback Collection**
+
+```python
+class UGFArtworkFeedbackCollector:
+    def __init__(self):
+        self.feedback_database = []
+        self.aesthetic_evaluator = AestheticEvaluator()
+        self.performance_monitor = PerformanceMonitor()
+    
+    def collect_feedback(self, ugf_schema, generated_artwork, user_interaction):
+        feedback = {
+            # Automated aesthetic evaluation
+            "aesthetic_score": self.aesthetic_evaluator.score(generated_artwork),
+            
+            # Performance metrics
+            "fps": self.performance_monitor.get_fps(),
+            "memory_usage": self.performance_monitor.get_memory(),
+            
+            # User engagement
+            "interaction_time": user_interaction.duration,
+            "mouse_movement_entropy": user_interaction.calculate_entropy(),
+            "audio_response": user_interaction.audio_enabled,
+            
+            # Creative parameters
+            "prompt": ugf_schema.metadata.prompt,
+            "creative_dna": ugf_schema.metadata.creative_dna,
+            "systems_used": ugf_schema.systems,
+            
+            # Outcome quality
+            "visual_coherence": self.calculate_visual_coherence(generated_artwork),
+            "audio_sync_quality": self.calculate_audio_sync(generated_artwork),
+            "emotional_resonance": self.estimate_emotional_impact(user_interaction)
+        }
+        
+        self.feedback_database.append(feedback)
+        return feedback
+    
+    def generate_reward_signal(self, feedback):
+        # Weighted reward function
+        reward = (
+            feedback["aesthetic_score"] * 0.3 +
+            feedback["visual_coherence"] * 0.2 +
+            feedback["audio_sync_quality"] * 0.2 +
+            feedback["emotional_resonance"] * 0.2 +
+            min(feedback["fps"] / 60.0, 1.0) * 0.1  # Performance bonus
+        )
+        
+        # Penalty for poor performance
+        if feedback["fps"] < 30:
+            reward *= 0.7
+        
+        return reward
+```
+
+### **Proximal Policy Optimization (PPO) for Creative Improvement**
+
+```python
+class CreativePPOAgent:
+    def __init__(self, base_model):
+        self.base_model = base_model
+        self.policy_network = CreativePolicyNetwork()
+        self.value_network = ValueEstimationNetwork()
+        
+    def update_policy(self, feedback_batch):
+        """Update creative policy based on feedback"""
+        
+        # Calculate advantages
+        advantages = self.calculate_advantages(feedback_batch)
+        
+        # PPO loss
+        policy_loss = self.compute_policy_loss(feedback_batch, advantages)
+        value_loss = self.compute_value_loss(feedback_batch)
+        
+        # Combined loss
+        total_loss = policy_loss + 0.5 * value_loss
+        
+        # Gradient update
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.parameters(), 0.5)
+        self.optimizer.step()
+        
+        return {
+            "policy_loss": policy_loss.item(),
+            "value_loss": value_loss.item(),
+            "total_loss": total_loss.item()
+        }
+    
+    def generate_improved_ugf(self, prompt, previous_feedback=None):
+        """Generate UGF schema with policy improvements"""
+        
+        # Encode current state
+        state = self.encode_creative_state(prompt, previous_feedback)
+        
+        # Sample action from improved policy
+        action = self.policy_network.sample_action(state)
+        
+        # Convert action to UGF parameters
+        ugf_parameters = self.action_to_ugf_parameters(action)
+        
+        # Generate schema
+        ugf_schema = self.base_model.generate_ugf(prompt, ugf_parameters)
+        
+        return ugf_schema, action
+```
+
+## 🚀 Real-Time Training Pipeline
+
+### **Continuous Learning Architecture**
+
+```python
+class ContinuousUGFLearner:
+    def __init__(self):
+        self.base_model = self.load_base_model()
+        self.lora_adapters = {}
+        self.feedback_buffer = ReplayBuffer(capacity=10000)
+        self.training_scheduler = TrainingScheduler()
+        
+    async def real_time_learning_loop(self):
+        """Continuous learning from user interactions"""
+        
+        while True:
+            # Collect recent feedback
+            recent_feedback = self.feedback_buffer.sample_recent(batch_size=32)
+            
+            if len(recent_feedback) >= 32:
+                # Identify underperforming areas
+                performance_analysis = self.analyze_performance(recent_feedback)
+                
+                # Selective LoRA updates
+                if performance_analysis.needs_visual_update:
+                    await self.update_visual_lora(recent_feedback)
+                
+                if performance_analysis.needs_audio_update:
+                    await self.update_audio_lora(recent_feedback)
+                
+                # Log improvements
+                self.log_learning_progress(performance_analysis)
+            
+            # Wait for more feedback
+            await asyncio.sleep(60)  # Check every minute
+    
+    async def update_visual_lora(self, feedback_batch):
+        """Update visual LoRA based on feedback"""
+        
+        # Prepare training data
+        training_examples = self.prepare_visual_training_data(feedback_batch)
+        
+        # Quick LoRA update (few steps)
+        lora_trainer = self.create_lora_trainer("visual_style")
+        lora_trainer.train(training_examples, max_steps=10)
+        
+        # Deploy updated LoRA
+        self.deploy_updated_lora("visual_style", lora_trainer.model)
+        
+        print("✅ Visual LoRA updated based on user feedback")
+```
+
+## 📊 Training Data Collection Strategy
+
+### **Automated Data Curation**
+
+```python
+class UGFTrainingDataCurator:
+    def __init__(self):
+        self.data_sources = {
+            "artistic_references": ArtisticReferenceDB(),
+            "generative_art_examples": GenerativeArtCorpus(),
+            "music_visual_pairs": MusicVisualDatabase(),
+            "user_creations": UserGeneratedContent()
+        }
+    
+    def curate_visual_style_dataset(self, style_name, target_size=1000):
+        """Curate dataset for specific visual style LoRA"""
+        
+        dataset = []
+        
+        # Collect reference artworks
+        references = self.data_sources["artistic_references"].get_by_style(style_name)
+        
+        for reference in references[:target_size//2]:
+            # Generate descriptions using vision model
+            description = self.generate_artwork_description(reference.image)
+            
+            # Create expected UGF schema
+            expected_ugf = self.analyze_artwork_to_ugf(reference.image)
+            
+            dataset.append({
+                "prompt": description,
+                "reference_image": reference.image,
+                "expected_ugf": expected_ugf,
+                "style": style_name,
+                "quality_score": reference.quality_rating
+            })
+        
+        # Augment with synthetic examples
+        synthetic_examples = self.generate_synthetic_examples(style_name, target_size//2)
+        dataset.extend(synthetic_examples)
+        
+        return self.validate_and_clean_dataset(dataset)
+    
+    def generate_synthetic_examples(self, style_name, count):
+        """Generate synthetic training examples"""
+        
+        synthetic_data = []
+        
+        for _ in range(count):
+            # Generate creative prompt
+            prompt = self.prompt_generator.generate_style_prompt(style_name)
+            
+            # Create corresponding UGF schema
+            ugf_schema = self.ugf_template_generator.create_schema(
+                style=style_name,
+                complexity=random.uniform(0.3, 0.9),
+                energy=random.uniform(0.2, 0.8),
+                chaos=random.uniform(0.1, 0.7)
+            )
+            
+            synthetic_data.append({
+                "prompt": prompt,
+                "expected_ugf": ugf_schema,
+                "style": style_name,
+                "synthetic": True
+            })
+        
+        return synthetic_data
+```
+
+## 🎯 Performance Optimization Strategy
+
+### **Model Compression & Acceleration**
+
+```python
+# Model optimization pipeline
+class UGFModelOptimizer:
+    def __init__(self):
+        self.quantization_config = {
+            "bits": 4,
+            "group_size": 128,
+            "damp_percent": 0.1
+        }
+    
+    def optimize_for_browser(self, model_path):
+        """Optimize model for browser deployment"""
+        
+        # 1. Quantization
+        quantized_model = self.apply_gptq_quantization(model_path)
+        
+        # 2. Pruning
+        pruned_model = self.apply_structured_pruning(quantized_model, sparsity=0.3)
+        
+        # 3. Knowledge distillation
+        distilled_model = self.distill_knowledge(pruned_model, student_size="2B")
+        
+        # 4. Convert to ONNX/TensorFlow.js
+        browser_model = self.convert_for_browser(distilled_model)
+        
+        return browser_model
+    
+    def benchmark_inference_speed(self, model, test_prompts):
+        """Benchmark model performance"""
+        
+        times = []
+        for prompt in test_prompts:
+            start = time.time()
+            _ = model.generate_ugf(prompt)
+            times.append(time.time() - start)
+        
+        return {
+            "avg_inference_time": np.mean(times),
+            "p95_inference_time": np.percentile(times, 95),
+            "fps_equivalent": 1.0 / np.mean(times)
+        }
+```
+
+## 🎨 Advanced Training Techniques
+
+### **Multi-Modal Contrastive Learning**
+
+```python
+class MultiModalContrastiveLearner:
+    def __init__(self):
+        self.visual_encoder = CLIPVisionModel()
+        self.audio_encoder = AudioCLIP()
+        self.text_encoder = CLIPTextModel()
+        self.ugf_encoder = UGFSchemaEncoder()
+    
+    def contrastive_loss(self, visual_features, audio_features, ugf_features):
+        """Learn aligned representations across modalities"""
+        
+        # Normalize features
+        visual_features = F.normalize(visual_features, dim=-1)
+        audio_features = F.normalize(audio_features, dim=-1)
+        ugf_features = F.normalize(ugf_features, dim=-1)
+        
+        # Compute similarities
+        visual_ugf_sim = torch.matmul(visual_features, ugf_features.T)
+        audio_ugf_sim = torch.matmul(audio_features, ugf_features.T)
+        
+        # Contrastive loss
+        loss = self.info_nce_loss(visual_ugf_sim) + self.info_nce_loss(audio_ugf_sim)
+        
+        return loss
+```
+
+### **Genetic Algorithm for Creative Evolution**
+
+```python
+class CreativeGeneticAlgorithm:
+    def __init__(self, population_size=50):
+        self.population_size = population_size
+        self.population = self.initialize_population()
+    
+    def evolve_creative_parameters(self, feedback_scores):
+        """Evolve creative DNA using genetic algorithm"""
+        
+        # Selection
+        selected = self.selection(self.population, feedback_scores)
+        
+        # Crossover
+        offspring = []
+        for i in range(0, len(selected), 2):
+            child1, child2 = self.crossover(selected[i], selected[i+1])
+            offspring.extend([child1, child2])
+        
+        # Mutation
+        mutated = [self.mutate(individual) for individual in offspring]
+        
+        # New population
+        self.population = self.select_survivors(self.population + mutated, feedback_scores)
+        
+        return self.get_best_individual()
+    
+    def crossover(self, parent1, parent2):
+        """Creative DNA crossover"""
+        
+        child1 = {
+            "complexity": (parent1["complexity"] + parent2["complexity"]) / 2,
+            "energy": parent1["energy"],  # Inherit from parent1
+            "chaos": parent2["chaos"],    # Inherit from parent2
+            "style": self.blend_styles(parent1["style"], parent2["style"])
+        }
+        
+        child2 = {
+            "complexity": parent2["complexity"],
+            "energy": (parent1["energy"] + parent2["energy"]) / 2,
+            "chaos": parent1["chaos"],
+            "style": self.blend_styles(parent2["style"], parent1["style"])
+        }
+        
+        return child1, child2
+```
+
+## 🚀 Deployment Architecture
+
+### **Edge Computing Strategy**
+
+```python
+# Browser-optimized inference
+class BrowserUGFInference:
+    def __init__(self):
+        self.models = {
+            "base": None,  # Lightweight base model
+            "visual_loras": {},  # Style-specific LoRAs
+            "audio_loras": {}   # Audio mapping LoRAs
+        }
+        
+        self.model_cache = ModelCache(max_size_mb=500)  # Stay under 6GB VRAM
+    
+    async def load_models_progressive(self):
+        """Progressive model loading for better UX"""
+        
+        # 1. Load base model first (2GB)
+        self.models["base"] = await self.load_base_model()
+        yield "base_loaded"
+        
+        # 2. Load most common LoRAs (500MB each)
+        common_loras = ["cosmic_nebula", "ambient_electronic"]
+        for lora_name in common_loras:
+            lora = await self.load_lora(lora_name)
+            self.models["visual_loras"][lora_name] = lora
+            yield f"lora_loaded_{lora_name}"
+        
+        # 3. Load additional LoRAs on demand
+        yield "ready_for_inference"
+    
+    async def generate_ugf_optimized(self, prompt, style_preference=None):
+        """Memory-optimized UGF generation"""
+        
+        # Select appropriate LoRA
+        lora = self.select_optimal_lora(prompt, style_preference)
+        
+        # Load if not in cache
+        if lora not in self.model_cache:
+            await self.model_cache.load_lora(lora)
+        
+        # Generate with minimal memory footprint
+        with torch.cuda.amp.autocast():  # Mixed precision
+            ugf_schema = self.models["base"].generate_with_lora(
+                prompt, 
+                lora, 
+                max_tokens=512,
+                temperature=0.8
+            )
+        
+        return ugf_schema
+```
+
+## 📈 Recommended Implementation Roadmap
+
+### **Phase 1: Foundation (Weeks 1-2)**
+1. **Base Model**: Deploy Gemma 3 4B with 4-bit quantization
+2. **Data Collection**: Curate 1000 UGF training examples per style
+3. **Simple LoRAs**: Train 2-3 basic visual style LoRAs
+
+### **Phase 2: Core ML (Weeks 3-4)**
+1. **Custom Audio VAE**: Train specialized model for UGF audio mappings
+2. **Feedback System**: Implement basic reward collection
+3. **TensorFlow.js Integration**: Browser-based inference
+
+### **Phase 3: Advanced Learning (Weeks 5-6)**
+1. **PPO Training**: Implement reinforcement learning pipeline
+2. **Multi-modal Training**: Contrastive learning across modalities
+3. **Continuous Learning**: Real-time model updates
+
+### **Phase 4: Production (Weeks 7-8)**
+1. **Model Optimization**: Quantization, pruning, distillation
+2. **Edge Deployment**: Optimized browser inference
+3. **Performance Monitoring**: Real-time metrics and adaptation
+
+## 🎯 Success Metrics
+
+| Metric | Target | Measurement |
+|--------|--------|-------------|
+| **Inference Speed** | <500ms | Time from prompt to UGF schema |
+| **Memory Usage** | <4GB VRAM | Peak GPU memory during inference |
+| **Aesthetic Quality** | >0.8/1.0 | Automated aesthetic evaluation |
+| **User Engagement** | >2min avg | Session duration with generated art |
+| **Creative Diversity** | >0.9 | Embedding space coverage |
+
+This ML strategy transforms our framework from a proof-of-concept into a production-ready AI creative system that continuously learns and improves from user interactions! 🚀
+
+
+#!/usr/bin/env python3
+"""
+UGF + AI Framework: Complete Training Pipeline
+Implements LoRA training, feedback collection, and continuous learning
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from peft import LoraConfig, get_peft_model, TaskType
+from datasets import Dataset
+import json
+import numpy as np
+from pathlib import Path
+import asyncio
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+import time
+import logging
+
+# =============================================================================
+# CORE TRAINING INFRASTRUCTURE
+# =============================================================================
+
+@dataclass
+class UGFTrainingConfig:
+    """Configuration for UGF model training"""
+    base_model: str = "google/gemma-3-4b-it"
+    max_seq_length: int = 2048
+    lora_rank: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.1
+    target_modules: List[str] = None
+    training_batch_size: int = 2
+    gradient_accumulation_steps: int = 4
+    learning_rate: float = 2e-4
+    num_train_epochs: int = 3
+    warmup_steps: int = 100
+    max_steps: int = 1000
+    output_dir: str = "./ugf_training_outputs"
+    
+    def __post_init__(self):
+        if self.target_modules is None:
+            self.target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+class UGFDatasetGenerator:
+    """Generates training datasets for UGF LoRAs"""
+    
+    def __init__(self):
+        self.artistic_styles = {
+            "cosmic_nebula": {
+                "descriptors": ["cosmic", "nebula", "stellar", "galactic", "ethereal", "swirling"],
+                "systems": ["gpu_compute_pipeline", "particle_flow"],
+                "complexity_range": (0.6, 0.9),
+                "energy_range": (0.5, 0.8),
+                "chaos_range": (0.4, 0.7)
+            },
+            "bioluminescent_forest": {
+                "descriptors": ["bioluminescent", "forest", "organic", "glowing", "mystical", "branching"],
+                "systems": ["l_system", "reaction_diffusion"],
+                "complexity_range": (0.7, 0.9),
+                "energy_range": (0.3, 0.6),
+                "chaos_range": (0.2, 0.5)
+            },
+            "geometric_minimalism": {
+                "descriptors": ["geometric", "minimal", "clean", "precise", "structured", "mathematical"],
+                "systems": ["r_function_composition", "geometric_primitives"],
+                "complexity_range": (0.2, 0.5),
+                "energy_range": (0.1, 0.4),
+                "chaos_range": (0.1, 0.3)
+            }
+        }
+        
+        self.audio_styles = {
+            "ambient_electronic": {
+                "features": ["low_frequency_energy", "spectral_centroid", "rms"],
+                "mappings": ["energy_level", "color_shift", "particle_speed"],
+                "tempo_range": (60, 100),
+                "energy_range": (0.2, 0.6)
+            },
+            "rhythmic_percussive": {
+                "features": ["transient_detected", "spectral_flux", "beat_tracking"],
+                "mappings": ["chaos_injection", "system_switching", "burst_generation"],
+                "tempo_range": (120, 180),
+                "energy_range": (0.6, 0.9)
+            }
+        }
+    
+    def generate_visual_style_dataset(self, style_name: str, num_examples: int = 1000) -> List[Dict]:
+        """Generate training examples for visual style LoRA"""
+        
+        if style_name not in self.artistic_styles:
+            raise ValueError(f"Unknown style: {style_name}")
+        
+        style_config = self.artistic_styles[style_name]
+        dataset = []
+        
+        for i in range(num_examples):
+            # Generate creative prompt
+            prompt = self._generate_creative_prompt(style_config)
+            
+            # Generate corresponding UGF schema
+            ugf_schema = self._generate_ugf_schema(style_config, prompt)
+            
+            # Create training example
+            example = {
+                "input": f"Generate a UGF visual schema for: {prompt}",
+                "output": json.dumps(ugf_schema, indent=2),
+                "style": style_name,
+                "metadata": {
+                    "complexity": ugf_schema.get("creative_dna", {}).get("complexity", 0.5),
+                    "energy": ugf_schema.get("creative_dna", {}).get("energy", 0.5),
+                    "chaos": ugf_schema.get("creative_dna", {}).get("chaos", 0.3)
+                }
+            }
+            
+            dataset.append(example)
+            
+            if i % 100 == 0:
+                print(f"Generated {i}/{num_examples} examples for {style_name}")
+        
+        return dataset
+    
+    def generate_audio_mapping_dataset(self, style_name: str, num_examples: int = 500) -> List[Dict]:
+        """Generate training examples for audio mapping LoRA"""
+        
+        if style_name not in self.audio_styles:
+            raise ValueError(f"Unknown audio style: {style_name}")
+        
+        style_config = self.audio_styles[style_name]
+        dataset = []
+        
+        for i in range(num_examples):
+            # Generate audio context description
+            audio_context = self._generate_audio_context(style_config)
+            
+            # Generate corresponding audio mappings
+            audio_mappings = self._generate_audio_mappings(style_config, audio_context)
+            
+            # Create training example
+            example = {
+                "input": f"Generate UGF audio mappings for: {audio_context}",
+                "output": json.dumps(audio_mappings, indent=2),
+                "style": style_name,
+                "metadata": {
+                    "tempo": audio_context.get("tempo", 120),
+                    "energy": audio_context.get("energy", 0.5)
+                }
+            }
+            
+            dataset.append(example)
+        
+        return dataset
+    
+    def _generate_creative_prompt(self, style_config: Dict) -> str:
+        """Generate a creative prompt for the given style"""
+        import random
+        
+        descriptors = random.sample(style_config["descriptors"], 2)
+        actions = ["flowing", "pulsing", "evolving", "dancing", "swirling", "growing"]
+        elements = ["particles", "forms", "patterns", "structures", "energy", "light"]
+        
+        action = random.choice(actions)
+        element = random.choice(elements)
+        
+        return f"A {descriptors[0]} {descriptors[1]} scene with {action} {element}"
+    
+    def _generate_ugf_schema(self, style_config: Dict, prompt: str) -> Dict:
+        """Generate a UGF schema based on style configuration"""
+        import random
+        
+        complexity = random.uniform(*style_config["complexity_range"])
+        energy = random.uniform(*style_config["energy_range"])
+        chaos = random.uniform(*style_config["chaos_range"])
+        
+        systems = random.sample(style_config["systems"], 
+                               min(2, len(style_config["systems"])))
+        
+        schema = {
+            "ugf_version": "2.3",
+            "scene_metadata": {
+                "name": f"Generated {prompt}",
+                "description": prompt
+            },
+            "creative_dna": {
+                "complexity": complexity,
+                "energy": energy,
+                "chaos": chaos
+            },
+            "systems": [],
+            "entities": []
+        }
+        
+        # Add systems based on style
+        for system_type in systems:
+            system_def = self._create_system_definition(system_type, complexity, energy, chaos)
+            schema["systems"].append(system_def)
+        
+        return schema
+    
+    def _create_system_definition(self, system_type: str, complexity: float, 
+                                energy: float, chaos: float) -> Dict:
+        """Create a system definition with realistic parameters"""
+        
+        if system_type == "gpu_compute_pipeline":
+            return {
+                "id": f"{system_type}_{int(time.time())}",
+                "type": system_type,
+                "uniforms": {
+                    "physics": {
+                        "particle_count": int(5000 + complexity * 15000),
+                        "chaos_level": chaos,
+                        "energy_level": energy,
+                        "noise_strength": chaos * 0.5
+                    }
+                }
+            }
+        elif system_type == "l_system":
+            return {
+                "id": f"{system_type}_{int(time.time())}",
+                "type": system_type,
+                "axiom": "F",
+                "rules": {"F": "F+F-F-F+F"},
+                "iterations": int(3 + complexity * 4),
+                "angle": 90.0
+            }
+        elif system_type == "reaction_diffusion":
+            return {
+                "id": f"{system_type}_{int(time.time())}",
+                "type": system_type,
+                "model": "Gray-Scott",
+                "parameters": {
+                    "feed_rate": 0.055 + chaos * 0.02,
+                    "kill_rate": 0.062 + energy * 0.01
+                }
+            }
+        else:
+            return {
+                "id": f"{system_type}_{int(time.time())}",
+                "type": system_type,
+                "parameters": {
+                    "complexity": complexity,
+                    "energy": energy,
+                    "chaos": chaos
+                }
+            }
+    
+    def _generate_audio_context(self, style_config: Dict) -> Dict:
+        """Generate audio context description"""
+        import random
+        
+        tempo = random.randint(*style_config["tempo_range"])
+        energy = random.uniform(*style_config["energy_range"])
+        
+        genres = {
+            "ambient_electronic": ["ambient", "drone", "atmospheric", "synthesized"],
+            "rhythmic_percussive": ["techno", "drum and bass", "electronic", "rhythmic"]
+        }
+        
+        return {
+            "tempo": tempo,
+            "energy": energy,
+            "genre": random.choice(genres.get(style_config.get("name", "ambient_electronic"), ["ambient"])),
+            "features": style_config["features"]
+        }
+    
+    def _generate_audio_mappings(self, style_config: Dict, audio_context: Dict) -> Dict:
+        """Generate realistic audio mappings"""
+        import random
+        
+        mappings = []
+        
+        for i, feature in enumerate(style_config["features"]):
+            mapping = style_config["mappings"][i % len(style_config["mappings"])]
+            
+            mapping_def = {
+                "audio_feature": feature,
+                "target_path": f"systems.primary_system.uniforms.{mapping}",
+                "mapping_function": self._generate_mapping_function(feature),
+                "smoothing_factor": 0.8 + random.random() * 0.15
+            }
+            
+            mappings.append(mapping_def)
+        
+        return {
+            "entity_mappings": [
+                {
+                    "target_entity_id": "primary_entity",
+                    "mappings": mappings
+                }
+            ]
+        }
+    
+    def _generate_mapping_function(self, feature: str) -> str:
+        """Generate realistic mapping functions"""
+        import random
+        
+        functions = {
+            "rms": [
+                "base_value * (1 + audio_feature * 2.0)",
+                "base_value + audio_feature * 0.5",
+                "mix(base_value, base_value * 2.0, audio_feature)"
+            ],
+            "spectral_centroid": [
+                "base_value + (audio_feature / 1000.0) * 0.3",
+                "base_value * (1 + sin(audio_feature * 0.01) * 0.2)"
+            ],
+            "transient_detected": [
+                "if(audio_feature > 0.8, base_value * 1.5, base_value)",
+                "base_value + step(0.7, audio_feature) * 0.3"
+            ]
+        }
+        
+        available_functions = functions.get(feature, ["base_value * (1 + audio_feature)"])
+        return random.choice(available_functions)
+
+class UGFLoRATrainer:
+    """Handles LoRA training for UGF models"""
+    
+    def __init__(self, config: UGFTrainingConfig):
+        self.config = config
+        self.model = None
+        self.tokenizer = None
+        self.peft_model = None
+        
+        # Setup logging
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+    
+    def setup_model(self):
+        """Initialize base model and tokenizer"""
+        self.logger.info(f"Loading base model: {self.config.base_model}")
+        
+        # Load model with 4-bit quantization for 6GB VRAM
+        from transformers import BitsAndBytesConfig
+        
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4"
+        )
+        
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.config.base_model,
+            quantization_config=quantization_config,
+            device_map="auto",
+            torch_dtype=torch.float16,
+            trust_remote_code=True
+        )
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config.base_model)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        self.logger.info("Base model loaded successfully")
+    
+    def create_lora_config(self, task_type: str = "CAUSAL_LM") -> LoraConfig:
+        """Create LoRA configuration"""
+        return LoraConfig(
+            task_type=getattr(TaskType, task_type),
+            r=self.config.lora_rank,
+            lora_alpha=self.config.lora_alpha,
+            lora_dropout=self.config.lora_dropout,
+            target_modules=self.config.target_modules,
+            bias="none",
+            inference_mode=False
+        )
+    
+    def prepare_dataset(self, examples: List[Dict]) -> Dataset:
+        """Prepare dataset for training"""
+        
+        def format_example(example):
+            """Format example for instruction tuning"""
+            instruction = example["input"]
+            response = example["output"]
+            
+            # Format as conversation
+            formatted = f"<|user|>\n{instruction}\n<|assistant|>\n{response}<|end|>"
+            
+            return {"text": formatted}
+        
+        # Format all examples
+        formatted_examples = [format_example(ex) for ex in examples]
+        
+        # Create dataset
+        dataset = Dataset.from_list(formatted_examples)
+        
+        # Tokenize
+        def tokenize_function(examples):
+            return self.tokenizer(
+                examples["text"],
+                truncation=True,
+                padding=True,
+                max_length=self.config.max_seq_length,
+                return_tensors="pt"
+            )
+        
+        tokenized_dataset = dataset.map(tokenize_function, batched=True)
+        return tokenized_dataset
+    
+    async def train_visual_style_lora(self, style_name: str, num_examples: int = 1000):
+        """Train a LoRA for specific visual style"""
+        
+        self.logger.info(f"Training visual style LoRA: {style_name}")
+        
+        # Generate training data
+        data_generator = UGFDatasetGenerator()
+        examples = data_generator.generate_visual_style_dataset(style_name, num_examples)
+        
+        # Prepare dataset
+        dataset = self.prepare_dataset(examples)
+        
+        # Create LoRA model
+        lora_config = self.create_lora_config()
+        self.peft_model = get_peft_model(self.model, lora_config)
+        
+        # Training arguments
+        training_args = TrainingArguments(
+            output_dir=f"{self.config.output_dir}/{style_name}",
+            per_device_train_batch_size=self.config.training_batch_size,
+            gradient_accumulation_steps=self.config.gradient_accumulation_steps,
+            learning_rate=self.config.learning_rate,
+            num_train_epochs=self.config.num_train_epochs,
+            max_steps=self.config.max_steps,
+            warmup_steps=self.config.warmup_steps,
+            logging_steps=10,
+            save_steps=100,
+            fp16=True,
+            dataloader_drop_last=True,
+            report_to=None  # Disable wandb for now
+        )
+        
+        # Create trainer
+        from trl import SFTTrainer
+        
+        trainer = SFTTrainer(
+            model=self.peft_model,
+            tokenizer=self.tokenizer,
+            train_dataset=dataset,
+            dataset_text_field="text",
+            max_seq_length=self.config.max_seq_length,
+            args=training_args
+        )
+        
+        # Train
+        self.logger.info("Starting training...")
+        trainer.train()
+        
+        # Save LoRA
+        lora_path = f"{self.config.output_dir}/{style_name}_lora"
+        self.peft_model.save_pretrained(lora_path)
+        
+        self.logger.info(f"LoRA saved to {lora_path}")
+        
+        return lora_path
+    
+    async def train_audio_mapping_lora(self, style_name: str, num_examples: int = 500):
+        """Train a LoRA for audio mappings"""
+        
+        self.logger.info(f"Training audio mapping LoRA: {style_name}")
+        
+        # Similar to visual style training but for audio mappings
+        data_generator = UGFDatasetGenerator()
+        examples = data_generator.generate_audio_mapping_dataset(style_name, num_examples)
+        
+        # Follow same training process as visual style
+        dataset = self.prepare_dataset(examples)
+        
+        # Create separate LoRA configuration for audio mappings
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=8,  # Smaller rank for audio mappings
+            lora_alpha=16,
+            lora_dropout=0.1,
+            target_modules=["gate_proj", "up_proj", "down_proj"],  # Different modules
+            bias="none",
+            inference_mode=False
+        )
+        
+        self.peft_model = get_peft_model(self.model, lora_config)
+        
+        # Train with same process
+        training_args = TrainingArguments(
+            output_dir=f"{self.config.output_dir}/{style_name}_audio",
+            per_device_train_batch_size=self.config.training_batch_size,
+            gradient_accumulation_steps=self.config.gradient_accumulation_steps,
+            learning_rate=self.config.learning_rate * 0.5,  # Lower LR for audio
+            num_train_epochs=2,  # Fewer epochs
+            max_steps=self.config.max_steps // 2,
+            warmup_steps=50,
+            logging_steps=5,
+            save_steps=50,
+            fp16=True,
+            dataloader_drop_last=True,
+            report_to=None
+        )
+        
+        from trl import SFTTrainer
+        
+        trainer = SFTTrainer(
+            model=self.peft_model,
+            tokenizer=self.tokenizer,
+            train_dataset=dataset,
+            dataset_text_field="text",
+            max_seq_length=self.config.max_seq_length,
+            args=training_args
+        )
+        
+        trainer.train()
+        
+        # Save audio LoRA
+        lora_path = f"{self.config.output_dir}/{style_name}_audio_lora"
+        self.peft_model.save_pretrained(lora_path)
+        
+        self.logger.info(f"Audio LoRA saved to {lora_path}")
+        
+        return lora_path
+
+# =============================================================================
+# FEEDBACK COLLECTION & REINFORCEMENT LEARNING
+# =============================================================================
+
+class UGFFeedbackCollector:
+    """Collects and processes feedback for continuous learning"""
+    
+    def __init__(self):
+        self.feedback_buffer = []
+        self.aesthetic_evaluator = AestheticEvaluator()
+        self.performance_monitor = PerformanceMonitor()
+    
+    def collect_artwork_feedback(self, ugf_schema: Dict, user_interaction: Dict) -> Dict:
+        """Collect comprehensive feedback on generated artwork"""
+        
+        feedback = {
+            "timestamp": time.time(),
+            "ugf_schema": ugf_schema,
+            "user_interaction": user_interaction,
+            
+            # Automated evaluations
+            "aesthetic_score": self.aesthetic_evaluator.evaluate(ugf_schema),
+            "technical_quality": self.evaluate_technical_quality(ugf_schema),
+            "performance_metrics": self.performance_monitor.get_metrics(),
+            
+            # User engagement metrics
+            "engagement_score": self.calculate_engagement_score(user_interaction),
+            "interaction_entropy": self.calculate_interaction_entropy(user_interaction),
+            
+            # Creative parameter analysis
+            "parameter_effectiveness": self.evaluate_parameter_effectiveness(ugf_schema, user_interaction)
+        }
+        
+        self.feedback_buffer.append(feedback)
+        return feedback
+    
+    def calculate_engagement_score(self, user_interaction: Dict) -> float:
+        """Calculate user engagement score from interaction data"""
+        
+        score = 0.0
+        
+        # Time spent interacting
+        interaction_time = user_interaction.get("duration", 0)
+        score += min(interaction_time / 300.0, 1.0) * 0.3  # Up to 5 minutes
+        
+        # Mouse movement activity
+        mouse_activity = user_interaction.get("mouse_movement_distance", 0)
+        score += min(mouse_activity / 10000.0, 1.0) * 0.2
+        
+        # Audio interaction
+        if user_interaction.get("audio_enabled", False):
+            score += 0.2
+        
+        # Parameter adjustments
+        param_changes = user_interaction.get("parameter_changes", 0)
+        score += min(param_changes / 10.0, 1.0) * 0.3
+        
+        return min(score, 1.0)
+    
+    def calculate_interaction_entropy(self, user_interaction: Dict) -> float:
+        """Calculate entropy of user interactions (higher = more exploratory)"""
+        
+        actions = user_interaction.get("actions", [])
+        if not actions:
+            return 0.0
+        
+        # Count action types
+        action_counts = {}
+        for action in actions:
+            action_type = action.get("type", "unknown")
+            action_counts[action_type] = action_counts.get(action_type, 0) + 1
+        
+        # Calculate entropy
+        total_actions = len(actions)
+        entropy = 0.0
+        
+        for count in action_counts.values():
+            p = count / total_actions
+            if p > 0:
+                entropy -= p * np.log2(p)
+        
+        return entropy
+    
+    def evaluate_parameter_effectiveness(self, ugf_schema: Dict, user_interaction: Dict) -> Dict:
+        """Evaluate how effective different parameters were"""
+        
+        creative_dna = ugf_schema.get("creative_dna", {})
+        engagement = self.calculate_engagement_score(user_interaction)
+        
+        # Evaluate each parameter's contribution to engagement
+        effectiveness = {}
+        
+        for param, value in creative_dna.items():
+            # Heuristic: higher engagement with more extreme values suggests effectiveness
+            param_extremeness = abs(value - 0.5) * 2  # 0 to 1
+            effectiveness[param] = param_extremeness * engagement
+        
+        return effectiveness
+
+class AestheticEvaluator:
+    """Evaluates aesthetic quality of generated artworks"""
+    
+    def __init__(self):
+        # In a real implementation, this could use a trained aesthetic prediction model
+        self.aesthetic_model = None
+    
+    def evaluate(self, ugf_schema: Dict) -> float:
+        """Evaluate aesthetic quality of UGF schema"""
+        
+        # Placeholder implementation - in reality, this would use ML models
+        # to evaluate visual aesthetics, color harmony, composition, etc.
+        
+        creative_dna = ugf_schema.get("creative_dna", {})
+        systems = ugf_schema.get("systems", [])
+        
+        score = 0.0
+        
+        # Complexity balance (not too simple, not too chaotic)
+        complexity = creative_dna.get("complexity", 0.5)
+        complexity_score = 1.0 - abs(complexity - 0.7) * 2  # Prefer ~0.7 complexity
+        score += complexity_score * 0.3
+        
+        # Energy appropriateness
+        energy = creative_dna.get("energy", 0.5)
+        energy_score = 1.0 - abs(energy - 0.6) * 2  # Prefer moderate-high energy
+        score += energy_score * 0.2
+        
+        # System diversity
+        system_diversity = len(set(s.get("type", "") for s in systems)) / 3.0
+        score += system_diversity * 0.3
+        
+        # Chaos control (some chaos is good, too much is bad)
+        chaos = creative_dna.get("chaos", 0.3)
+        chaos_score = 1.0 - max(0, chaos - 0.6) * 2  # Penalize excessive chaos
+        score += chaos_score * 0.2
+        
+        return max(0.0, min(1.0, score))
+
+class PerformanceMonitor:
+    """Monitors system performance metrics"""
+    
+    def __init__(self):
+        self.metrics_history = []
+    
+    def get_metrics(self) -> Dict:
+        """Get current performance metrics"""
+        
+        metrics = {
+            "gpu_memory_usage": self.get_gpu_memory_usage(),
+            "cpu_usage": self.get_cpu_usage(),
+            "fps": self.get_current_fps(),
+            "inference_time": self.get_inference_time()
+        }
+        
+        self.metrics_history.append(metrics)
+        return metrics
+    
+    def get_gpu_memory_usage(self) -> float:
+        """Get GPU memory usage in GB"""
+        if torch.cuda.is_available():
+            return torch.cuda.memory_allocated() / 1024**3
+        return 0.0
+    
+    def get_cpu_usage(self) -> float:
+        """Get CPU usage percentage"""
+        import psutil
+        return psutil.cpu_percent()
+    
+    def get_current_fps(self) -> float:
+        """Get current rendering FPS (placeholder)"""
+        # In real implementation, this would be provided by the Three.js frontend
+        return 60.0
+    
+    def get_inference_time(self) -> float:
+        """Get average inference time (placeholder)"""
+        # Would be measured during actual model inference
+        return 0.5
+
+# =============================================================================
+# CONTINUOUS LEARNING SYSTEM
+# =============================================================================
+
+class ContinuousLearningManager:
+    """Manages continuous learning from user feedback"""
+    
+    def __init__(self, trainer: UGFLoRATrainer):
+        self.trainer = trainer
+        self.feedback_collector = UGFFeedbackCollector()
+        self.learning_schedule = ContinuousLearningSchedule()
+        self.is_running = False
+    
+    async def start_continuous_learning(self):
+        """Start the continuous learning loop"""
+        
+        self.is_running = True
+        self.logger = logging.getLogger(__name__)
+        self.logger.info("Starting continuous learning system...")
+        
+        while self.is_running:
+            try:
+                # Collect recent feedback
+                recent_feedback = self.get_recent_feedback()
+                
+                if len(recent_feedback) >= 32:  # Minimum batch size
+                    # Analyze feedback for learning opportunities
+                    learning_analysis = self.analyze_learning_opportunities(recent_feedback)
+                    
+                    # Execute learning updates
+                    await self.execute_learning_updates(learning_analysis)
+                    
+                    # Update learning schedule
+                    self.learning_schedule.update_schedule(learning_analysis)
+                
+                # Wait before next iteration
+                await asyncio.sleep(self.learning_schedule.get_next_interval())
+                
+            except Exception as e:
+                self.logger.error(f"Error in continuous learning loop: {e}")
+                await asyncio.sleep(60)  # Wait before retrying
+    
+    def get_recent_feedback(self) -> List[Dict]:
+        """Get recent feedback for learning"""
+        
+        current_time = time.time()
+        recent_feedback = []
+        
+        for feedback in self.feedback_collector.feedback_buffer:
+            if current_time - feedback["timestamp"] < 3600:  # Last hour
+                recent_feedback.append(feedback)
+        
+        return recent_feedback
+    
+    def analyze_learning_opportunities(self, feedback_batch: List[Dict]) -> Dict:
+        """Analyze feedback to identify learning opportunities"""
+        
+        analysis = {
+            "needs_visual_update": False,
+            "needs_audio_update": False,
+            "underperforming_styles": [],
+            "high_performing_patterns": [],
+            "performance_issues": []
+        }
+        
+        # Analyze aesthetic scores by style
+        style_scores = {}
+        for feedback in feedback_batch:
+            ugf_schema = feedback["ugf_schema"]
+            aesthetic_score = feedback["aesthetic_score"]
+            
+            # Extract style indicators from schema
+            style = self.extract_style_from_schema(ugf_schema)
+            if style not in style_scores:
+                style_scores[style] = []
+            style_scores[style].append(aesthetic_score)
+        
+        # Identify underperforming styles
+        for style, scores in style_scores.items():
+            avg_score = np.mean(scores)
+            if avg_score < 0.6:  # Threshold for update
+                analysis["underperforming_styles"].append(style)
+                analysis["needs_visual_update"] = True
+        
+        # Check for performance issues
+        performance_scores = [f["performance_metrics"]["fps"] for f in feedback_batch]
+        if np.mean(performance_scores) < 45:  # FPS threshold
+            analysis["performance_issues"].append("low_fps")
+        
+        return analysis
+    
+    async def execute_learning_updates(self, analysis: Dict):
+        """Execute learning updates based on analysis"""
+        
+        if analysis["needs_visual_update"]:
+            for style in analysis["underperforming_styles"]:
+                self.logger.info(f"Updating visual LoRA for underperforming style: {style}")
+                
+                # Generate additional training data
+                await self.generate_targeted_training_data(style)
+                
+                # Quick LoRA update (few steps)
+                await self.trainer.train_visual_style_lora(style, num_examples=100)
+        
+        if analysis["performance_issues"]:
+            self.logger.info("Optimizing for performance issues")
+            await self.optimize_for_performance()
+    
+    async def generate_targeted_training_data(self, style: str):
+        """Generate targeted training data for specific style improvement"""
+        
+        # Generate examples that address specific weaknesses
+        data_generator = UGFDatasetGenerator()
+        
+        # Focus on higher quality examples
+        examples = data_generator.generate_visual_style_dataset(style, num_examples=200)
+        
+        # Filter for high-quality examples (this could use ML-based filtering)
+        filtered_examples = [ex for ex in examples 
+                           if ex["metadata"]["complexity"] > 0.6]
+        
+        return filtered_examples
+    
+    async def optimize_for_performance(self):
+        """Optimize system for better performance"""
+        
+        # This could include:
+        # - Model quantization
+        # - Parameter pruning
+        # - Cache optimization
+        # - Dynamic quality scaling
+        
+        self.logger.info("Implementing performance optimizations...")
+        
+        # Placeholder for actual optimization logic
+        pass
+    
+    def extract_style_from_schema(self, ugf_schema: Dict) -> str:
+        """Extract style information from UGF schema"""
+        
+        # Heuristic style extraction based on systems and parameters
+        systems = ugf_schema.get("systems", [])
+        creative_dna = ugf_schema.get("creative_dna", {})
+        
+        if any(s.get("type") == "gpu_compute_pipeline" for s in systems):
+            if creative_dna.get("chaos", 0) > 0.5:
+                return "cosmic_nebula"
+        
+        if any(s.get("type") == "l_system" for s in systems):
+            return "bioluminescent_forest"
+        
+        if creative_dna.get("complexity", 0.5) < 0.4:
+            return "geometric_minimalism"
+        
+        return "unknown"
+
+class ContinuousLearningSchedule:
+    """Manages the schedule for continuous learning updates"""
+    
+    def __init__(self):
+        self.base_interval = 300  # 5 minutes
+        self.current_interval = self.base_interval
+        self.learning_history = []
+    
+    def update_schedule(self, learning_analysis: Dict):
+        """Update learning schedule based on analysis"""
+        
+        # Adapt interval based on learning needs
+        if learning_analysis["needs_visual_update"] or learning_analysis["needs_audio_update"]:
+            # Increase frequency when updates are needed
+            self.current_interval = max(60, self.current_interval * 0.8)
+        else:
+            # Decrease frequency when system is stable
+            self.current_interval = min(1800, self.current_interval * 1.1)
+    
+    def get_next_interval(self) -> float:
+        """Get the interval until next learning iteration"""
+        return self.current_interval
+
+# =============================================================================
+# MAIN TRAINING ORCHESTRATOR
+# =============================================================================
+
+async def main_training_pipeline():
+    """Main training pipeline for the UGF + AI framework"""
+    
+    # Setup training configuration
+    config = UGFTrainingConfig(
+        base_model="google/gemma-3-4b-it",
+        max_steps=500,  # Quick training for demo
+        output_dir="./ugf_training_outputs"
+    )
+    
+    # Initialize trainer
+    trainer = UGFLoRATrainer(config)
+    trainer.setup_model()
+    
+    print("🎨 Starting UGF + AI Framework Training Pipeline")
+    print("=" * 60)
+    
+    # Phase 1: Train visual style LoRAs
+    print("\n📊 Phase 1: Training Visual Style LoRAs")
+    visual_styles = ["cosmic_nebula", "bioluminescent_forest", "geometric_minimalism"]
+    
+    for style in visual_styles:
+        print(f"\n🎯 Training visual LoRA for: {style}")
+        lora_path = await trainer.train_visual_style_lora(style, num_examples=100)
+        print(f"✅ Completed: {lora_path}")
+    
+    # Phase 2: Train audio mapping LoRAs
+    print("\n🎵 Phase 2: Training Audio Mapping LoRAs")
+    audio_styles = ["ambient_electronic", "rhythmic_percussive"]
+    
+    for style in audio_styles:
+        print(f"\n🎯 Training audio LoRA for: {style}")
+        lora_path = await trainer.train_audio_mapping_lora(style, num_examples=50)
+        print(f"✅ Completed: {lora_path}")
+    
+    # Phase 3: Setup continuous learning
+    print("\n🔄 Phase 3: Initializing Continuous Learning")
+    continuous_learner = ContinuousLearningManager(trainer)
+    
+    print("🚀 Training pipeline completed!")
+    print("\nNext steps:")
+    print("1. Deploy trained LoRAs to browser")
+    print("2. Start continuous learning system")
+    print("3. Begin user feedback collection")
+    
+    # Start continuous learning (in background)
+    asyncio.create_task(continuous_learner.start_continuous_learning())
+    
+    return trainer, continuous_learner
+
+if __name__ == "__main__":
+    # Set up async event loop
+    import asyncio
+    
+    # Check CUDA availability
+    if torch.cuda.is_available():
+        print(f"🔥 CUDA available - GPU: {torch.cuda.get_device_name()}")
+        print(f"💾 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+    else:
+        print("⚠️  CUDA not available - training will be slow")
+    
+    # Run the training pipeline
+    asyncio.run(main_training_pipeline())
+
+🧠 ML Methods Deep Dive: Strategic Recommendations
+Your question hits the technical core of our framework! Let me break down the optimal ML approaches for our UGF + AI system:
+🔥 Critical Decision: TensorFlow.js vs ONNX.js vs WebGL Custom
+Recommendation: Hybrid Approach
+javascript// Optimal ML Stack for 6GB VRAM
+const mlStack = {
+    // Heavy lifting: ONNX.js for production inference (2-3x faster)
+    baseModel: "onnx.js",
+    
+    // Real-time features: TensorFlow.js for browser training
+    continuousLearning: "tensorflow.js", 
+    
+    // Custom compute: WebGL shaders for specialized operations
+    particlePhysics: "webgl_compute"
+};
+Why this combo wins:
+
+ONNX.js: 2-3x faster inference, smaller models, production-ready
+TensorFlow.js: Browser-based fine-tuning, real-time adaptation
+Custom WebGL: Maximum performance for UGF-specific computations
+
+🎵 MusicVAE vs Custom Audio ML: The Verdict
+Skip MusicVAE, Build Custom Audio-Visual VAE
+Problem with MusicVAE/Magenta.js:
+
+Outputs MIDI sequences, not UGF audio mappings
+No real-time parameter control
+Designed for note generation, not visual synchronization
+
+Our Custom Solution:
+pythonclass UGFAudioMappingVAE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Encoder: Real-time audio features → Latent space
+        self.audio_encoder = nn.Sequential(
+            nn.Linear(256, 128),  # Spectral features
+            nn.ReLU(), 
+            nn.Linear(128, 32)    # Compressed representation
+        )
+        
+        # Decoder: Latent → UGF mapping parameters
+        self.mapping_decoder = nn.Sequential(
+            nn.Linear(32, 64),
+            nn.ReLU(),
+            nn.Linear(64, 256)    # Direct UGF format output
+        )
+Advantages:
+
+Direct UGF audio mapping output
+Real-time parameter optimization
+Cross-modal training (visual + audio)
+Specialized for generative art
+
+🎯 LoRA Training Strategy: The 6GB VRAM Approach
+Recommended LoRA Architecture
+python# Optimized for 6GB VRAM
+lora_configs = {
+    "visual_style": {
+        "rank": 16,           # Balance of capability/memory
+        "alpha": 32,          # 2x rank for stability
+        "target_modules": ["q_proj", "v_proj", "o_proj"],
+        "dropout": 0.1
+    },
+    "audio_mapping": {
+        "rank": 8,            # Smaller for specialized task
+        "alpha": 16,
+        "target_modules": ["gate_proj", "up_proj", "down_proj"],
+        "dropout": 0.05
+    }
+}
+Training Data Strategy
+Quality over Quantity:
+
+1000 high-quality examples per style (not 10,000 mediocre ones)
+Curated artistic references + synthetic augmentation
+Cross-modal training (text + image + audio context)
+
+Data Sources:
+pythontraining_sources = {
+    "artistic_references": "WikiArt, DeviantArt APIs",
+    "generative_examples": "Procedurally generated UGF schemas", 
+    "user_creations": "Community-contributed artworks",
+    "synthetic_pairs": "AI-generated prompt/schema combinations"
+}
+🔄 Feedback & Reinforcement Learning: Multi-Modal Approach
+Feedback Collection Framework
+pythonclass AdvancedFeedbackCollector:
+    def collect_comprehensive_feedback(self, artwork):
+        return {
+            # Automated aesthetic evaluation
+            "aesthetic_score": self.cnn_aesthetic_model(artwork.screenshot),
+            
+            # User engagement metrics  
+            "interaction_entropy": self.calculate_mouse_movement_entropy(),
+            "session_duration": self.track_engagement_time(),
+            "audio_responsiveness": self.measure_audio_interaction(),
+            
+            # Performance metrics
+            "fps_stability": self.monitor_rendering_performance(),
+            "memory_efficiency": self.track_vram_usage(),
+            
+            # Creative coherence
+            "visual_audio_sync": self.measure_synchronization_quality(),
+            "parameter_effectiveness": self.evaluate_creative_dna()
+        }
+Proximal Policy Optimization (PPO) for Creative Enhancement
+Why PPO over other RL methods:
+
+Stable training with limited data
+Good for continuous parameter spaces
+Handles multi-objective rewards well
+
+pythonclass CreativePPO:
+    def __init__(self):
+        self.reward_function = self.create_multi_objective_reward()
+    
+    def create_multi_objective_reward(self):
+        return lambda feedback: (
+            feedback.aesthetic_score * 0.3 +       # Visual quality
+            feedback.interaction_entropy * 0.2 +   # User engagement  
+            feedback.audio_sync_quality * 0.2 +    # A/V coherence
+            feedback.performance_score * 0.2 +     # Technical quality
+            feedback.creative_novelty * 0.1        # Innovation bonus
+        )
+⚡ Real-Time Training: The Continuous Learning Loop
+Edge Computing Strategy
+javascript// Browser-based continuous learning
+class BrowserContinuousLearner {
+    constructor() {
+        this.feedbackBuffer = new CircularBuffer(1000);
+        this.microTrainer = new TensorFlowJSTrainer();
+    }
+    
+    async adaptInRealTime(userFeedback) {
+        // Collect feedback
+        this.feedbackBuffer.add(userFeedback);
+        
+        // Trigger micro-updates every 50 interactions
+        if (this.feedbackBuffer.size() % 50 === 0) {
+            const recentFeedback = this.feedbackBuffer.getRecent(50);
+            
+            // Quick 5-step gradient update
+            await this.microTrainer.quickUpdate(recentFeedback, {
+                steps: 5,
+                learningRate: 0.0001,
+                batchSize: 8
+            });
+        }
+    }
+}
+🚀 Performance Optimization: Memory-Efficient Training
+Gradient Checkpointing + Mixed Precision
+python# Memory optimization for 6GB VRAM
+training_optimizations = {
+    "gradient_checkpointing": True,     # 50% memory reduction
+    "mixed_precision": "fp16",          # 2x memory efficiency  
+    "gradient_accumulation": 8,         # Simulate larger batches
+    "cpu_offload": "partial",           # Offload when possible
+    "dynamic_batching": True            # Adjust batch size automatically
+}
+Model Compression Pipeline
+pythondef optimize_for_6gb_deployment(model):
+    # 1. 4-bit quantization (preserves 95% quality)
+    quantized = apply_gptq_quantization(model, bits=4)
+    
+    # 2. Knowledge distillation (50% size reduction)
+    distilled = distill_to_smaller_student(quantized, target_size="2B")
+    
+    # 3. Structured pruning (30% speedup)
+    pruned = apply_structured_pruning(distilled, sparsity=0.3)
+    
+    # 4. Convert to browser format
+    browser_ready = convert_to_onnx_or_tfjs(pruned)
+    
+    return browser_ready
+🎯 Recommended Implementation Timeline
+Week 1-2: Foundation
+bash# Install optimized stack
+pip install unsloth transformers[torch] peft
+npm install @tensorflow/tfjs onnxjs tone.js
+
+# Setup base model (4-bit quantized)
+python setup_gemma_3_4b_optimized.py
+Week 3-4: Core Training
+python# Train specialized LoRAs
+await train_visual_loras(["cosmic", "bio", "geometric"])
+await train_audio_loras(["ambient", "rhythmic"])
+Week 5-6: Feedback Systems
+javascript// Implement browser-based learning
+const feedbackCollector = new RealTimeFeedbackCollector();
+const continuousLearner = new BrowserMLTrainer();
+Week 7-8: Production Optimization
+python# Deploy optimized models
+deploy_onnx_models_to_browser()
+setup_continuous_learning_pipeline()
+🔬 Advanced Techniques Worth Exploring
+1. Cross-Modal Contrastive Learning
+Train unified embeddings across text, image, audio, and UGF schemas:
+python# Align visual aesthetics with audio characteristics
+contrastive_loss = align_modalities(
+    visual_features=extract_visual_features(artwork),
+    audio_features=extract_audio_features(music),
+    ugf_schema=encode_ugf_parameters(schema)
+)
+2. Genetic Algorithm Evolution
+Evolve creative parameters using evolutionary computation:
+pythonclass CreativeEvolution:
+    def evolve_artistic_dna(self, parent_schemas, fitness_scores):
+        # Selection, crossover, mutation for creative parameters
+        return evolved_creative_dna
+3. Neural Architecture Search (NAS)
+Automatically discover optimal model architectures for creative tasks:
+python# Find best LoRA configuration automatically
+optimal_lora = neural_architecture_search(
+    search_space=lora_architecture_space,
+    objective=creative_quality_metric,
+    constraints=memory_budget_6gb
+)
+💡 Key Success Factors
+
+Quality over Scale: 1000 perfect examples > 10000 mediocre ones
+Multi-modal Training: Always combine text, visual, and audio signals
+Real-time Adaptation: Continuous learning beats batch retraining
+Hardware Awareness: Design for 6GB VRAM from day 1
+User-Centric Metrics: Engagement and aesthetic quality matter most
+
+🎯 Bottom Line Recommendation
+For your 6GB VRAM setup:
+
+Base Model: Gemma 3 4B (quantized to 2.6GB)
+LoRA Training: Unsloth + specialized datasets (1000 examples each)
+Browser Inference: ONNX.js for speed + TensorFlow.js for learning
+Audio ML: Custom VAE (not MusicVAE) for UGF mappings
+Feedback: Multi-modal PPO with real-time browser updates
+
+This approach gives you production-ready AI creativity that continuously improves while staying within your hardware constraints. The combination of your UGF execution precision with this ML intelligence will create something unprecedented in generative art! 🚀
+Want me to detail any specific component or help implement the training pipeline?

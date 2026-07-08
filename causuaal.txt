@@ -1,0 +1,1659 @@
+#!/usr/bin/env python3
+"""
+PersonaLens-Evo: Self-Evolving Personal Chatbot Architecture
+A balanced approach combining theoretical rigor with practical implementation
+for creating an authentic, continuously learning digital representation.
+
+Core Philosophy:
+- User-Centric Evolution: All learning geared towards embodying your style/persona
+- Direct LLM Adaptation: Core language model fine-tuning with LoRA
+- Causal Understanding: Why certain responses work better
+- Proactive Engagement: Initiative-taking with Inner Thoughts framework
+- Lightweight Reflection: Practical self-correction mechanisms
+- Modular Enhancement: Incremental complexity addition
+
+Architecture Components:
+1. Adaptive Core Language Model (AC-LM) - LoRA-enhanced base model
+2. Causal Reflection Engine (CRE) - Understanding conversation dynamics
+3. Continual Learning Orchestrator (CLO) - Memory + fine-tuning coordination
+4. Proactive Engagement Predictor (PEP) - Initiative-taking with inner thoughts
+5. Reflective Memory Nexus (RMN) - Enhanced memory with reflection tags
+6. Authentic Quality Assessor (AQA) - User-centric quality evaluation
+7. Self-Correction Controller (SCC) - Learning from mistakes
+"""
+
+import json
+import time
+import random
+import logging
+import sqlite3
+import hashlib
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from dataclasses import dataclass, asdict, field
+from typing import List, Dict, Optional, Tuple, Any, Union
+from collections import deque, defaultdict
+import asyncio
+from datetime import datetime, timedelta
+
+# Core ML/AI libraries
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from transformers import (
+    AutoTokenizer, AutoModelForCausalLM, AutoModel,
+    Trainer, TrainingArguments, EarlyStoppingCallback,
+    pipeline
+)
+from sentence_transformers import SentenceTransformer
+import faiss
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy import stats
+import nltk
+
+# LoRA for efficient fine-tuning
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel
+
+# Safety and quality
+from detoxify import Detoxify
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class PersonalityProfile:
+    """Dynamic personality representation with confidence scores"""
+    humor_level: float = 0.5        # How often you use humor
+    technical_depth: float = 0.7     # How technical your explanations are
+    question_frequency: float = 0.6  # How often you ask questions
+    enthusiasm: float = 0.8          # Energy level in responses
+    empathy: float = 0.7            # Emotional responsiveness
+    formality: float = 0.4          # Casual vs formal language
+    verbosity: float = 0.6          # Response length preference
+    curiosity: float = 0.8          # Interest in exploring topics
+    
+    # Confidence in each trait (0-1)
+    confidence_scores: Dict[str, float] = field(default_factory=lambda: {})
+    
+    # Recent trait evolution tracking
+    trait_history: Dict[str, List[Tuple[float, float]]] = field(default_factory=lambda: {})
+    
+    def update_trait(self, trait: str, value: float, confidence: float = 1.0):
+        """Update personality trait with confidence tracking"""
+        if hasattr(self, trait):
+            old_value = getattr(self, trait)
+            # Weighted update based on confidence
+            new_value = (old_value * 0.8) + (value * 0.2 * confidence)
+            setattr(self, trait, max(0, min(1, new_value)))
+            
+            # Track evolution
+            if trait not in self.trait_history:
+                self.trait_history[trait] = []
+            self.trait_history[trait].append((time.time(), new_value))
+            
+            # Keep only recent history
+            cutoff = time.time() - (30 * 24 * 3600)  # 30 days
+            self.trait_history[trait] = [
+                (t, v) for t, v in self.trait_history[trait] if t > cutoff
+            ]
+            
+            self.confidence_scores[trait] = confidence
+
+@dataclass
+class InteractionMemory:
+    """Enhanced interaction record with reflection capabilities"""
+    id: str
+    timestamp: float
+    user_input: str
+    bot_response: str
+    context: List[str]
+    
+    # User feedback and quality
+    user_feedback: Optional[int] = None  # 1=good, -1=bad, 0=neutral
+    quality_score: float = 0.5
+    authenticity_score: float = 0.5
+    
+    # Learning metadata
+    topics: List[str] = field(default_factory=list)
+    reflection_tags: List[str] = field(default_factory=list)  # Lessons learned
+    personality_signals: Dict[str, float] = field(default_factory=dict)
+    
+    # Embeddings for retrieval
+    input_embedding: Optional[np.ndarray] = None
+    response_embedding: Optional[np.ndarray] = None
+    
+    # Causal analysis
+    causal_factors: Dict[str, float] = field(default_factory=dict)
+    counterfactual_notes: List[str] = field(default_factory=list)
+    
+    # Proactive engagement data
+    was_proactive: bool = False
+    proactive_success: Optional[bool] = None
+
+@dataclass
+class InnerThought:
+    """Represents AI's internal reasoning during conversation"""
+    timestamp: float
+    thought_type: str  # "curiosity", "clarification", "topic_shift", "emotional_response"
+    content: str
+    confidence: float
+    triggers: List[str]  # What triggered this thought
+    should_express: bool = False  # Whether to voice this thought
+
+class AdaptiveCoreLanguageModel:
+    """LoRA-enhanced base model with personality adaptation"""
+    
+    def __init__(self, base_model: str = "microsoft/DialoGPT-medium"):
+        self.base_model_name = base_model
+        self.tokenizer = AutoTokenizer.from_pretrained(base_model)
+        self.model = AutoModelForCausalLM.from_pretrained(base_model)
+        
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # LoRA configuration for efficient fine-tuning
+        self.lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=8,  # Low rank dimension
+            lora_alpha=16,  # LoRA scaling parameter
+            lora_dropout=0.1,
+            target_modules=["c_attn", "c_proj"],  # Target attention layers
+        )
+        
+        # Apply LoRA to model
+        self.model = get_peft_model(self.model, self.lora_config)
+        
+        # Training state
+        self.training_data = []
+        self.last_fine_tune = 0
+        self.fine_tune_threshold = 20  # Retrain after N positive interactions
+        
+    def add_training_example(self, user_input: str, bot_response: str, quality_score: float):
+        """Add high-quality interaction for fine-tuning"""
+        if quality_score > 0.7:  # Only use high-quality examples
+            dialogue = f"User: {user_input}\nBot: {bot_response}"
+            self.training_data.append(dialogue)
+    
+    def fine_tune_on_interactions(self, interactions: List[InteractionMemory]):
+        """Fine-tune model on positive interactions using LoRA"""
+        # Filter for positive interactions
+        positive_interactions = [
+            i for i in interactions 
+            if i.user_feedback == 1 or i.quality_score > 0.7
+        ]
+        
+        if len(positive_interactions) < 5:
+            logger.info("Not enough positive interactions for fine-tuning")
+            return False
+        
+        # Prepare training data
+        dialogues = []
+        for interaction in positive_interactions:
+            dialogue = f"User: {interaction.user_input}\nBot: {interaction.bot_response}"
+            dialogues.append(dialogue)
+        
+        try:
+            # Create dataset
+            train_dataset = PersonalityDataset(dialogues, self.tokenizer)
+            
+            # Training arguments
+            training_args = TrainingArguments(
+                output_dir="./personalens_checkpoints",
+                num_train_epochs=1,
+                per_device_train_batch_size=2,
+                gradient_accumulation_steps=4,
+                learning_rate=5e-5,
+                warmup_steps=10,
+                logging_steps=5,
+                save_strategy="no",  # Don't save intermediate checkpoints
+            )
+            
+            # Create trainer
+            trainer = Trainer(
+                model=self.model,
+                args=training_args,
+                train_dataset=train_dataset,
+            )
+            
+            # Fine-tune
+            logger.info(f"Fine-tuning on {len(dialogues)} positive interactions...")
+            trainer.train()
+            
+            self.last_fine_tune = time.time()
+            logger.info("✅ Model fine-tuning completed")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Fine-tuning failed: {e}")
+            return False
+    
+    def generate_response(self, prompt: str, personality: PersonalityProfile) -> str:
+        """Generate response with personality-aware prompting"""
+        # Build personality context
+        personality_prompt = self._build_personality_prompt(personality)
+        full_prompt = f"{personality_prompt}\n{prompt}\nBot:"
+        
+        # Tokenize
+        inputs = self.tokenizer.encode(
+            full_prompt, 
+            return_tensors="pt", 
+            max_length=400, 
+            truncation=True
+        )
+        
+        # Generate with personality-aware parameters
+        temperature = 0.7 + (personality.enthusiasm - 0.5) * 0.2
+        max_length = int(50 + personality.verbosity * 100)
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                inputs,
+                max_length=inputs.shape[1] + max_length,
+                temperature=temperature,
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id,
+                repetition_penalty=1.1
+            )
+        
+        # Decode response
+        response_ids = outputs[0][len(inputs[0]):]
+        response = self.tokenizer.decode(response_ids, skip_special_tokens=True).strip()
+        
+        return self._post_process_response(response, personality)
+    
+    def _build_personality_prompt(self, personality: PersonalityProfile) -> str:
+        """Build personality context for generation"""
+        traits = []
+        
+        if personality.humor_level > 0.6:
+            traits.append("I use humor and wit in my responses")
+        if personality.technical_depth > 0.6:
+            traits.append("I provide detailed, technical explanations")
+        if personality.empathy > 0.6:
+            traits.append("I respond with empathy and emotional understanding")
+        if personality.curiosity > 0.6:
+            traits.append("I ask thoughtful follow-up questions")
+        if personality.formality < 0.4:
+            traits.append("I use casual, friendly language")
+        elif personality.formality > 0.6:
+            traits.append("I communicate in a more formal, structured way")
+        
+        if traits:
+            return f"Personality: {', '.join(traits)}."
+        return "I am a helpful and engaging conversational partner."
+    
+    def _post_process_response(self, response: str, personality: PersonalityProfile) -> str:
+        """Post-process response based on personality"""
+        # Adjust length based on verbosity
+        sentences = response.split('. ')
+        max_sentences = max(1, int(personality.verbosity * 5))
+        
+        if len(sentences) > max_sentences:
+            response = '. '.join(sentences[:max_sentences]) + '.'
+        
+        # Ensure minimum quality
+        if len(response.split()) < 3:
+            response += " I'd be happy to explore this topic further with you."
+        
+        return response.strip()
+
+class PersonalityDataset(Dataset):
+    """Dataset for fine-tuning on conversation data"""
+    
+    def __init__(self, dialogues: List[str], tokenizer):
+        self.dialogues = dialogues
+        self.tokenizer = tokenizer
+    
+    def __len__(self):
+        return len(self.dialogues)
+    
+    def __getitem__(self, idx):
+        dialogue = self.dialogues[idx]
+        encoding = self.tokenizer(
+            dialogue,
+            truncation=True,
+            max_length=512,
+            padding="max_length",
+            return_tensors="pt"
+        )
+        
+        return {
+            "input_ids": encoding["input_ids"].flatten(),
+            "attention_mask": encoding["attention_mask"].flatten(),
+            "labels": encoding["input_ids"].flatten()
+        }
+
+class CausalReflectionEngine:
+    """Lightweight causal analysis for conversation improvement"""
+    
+    def __init__(self):
+        # Simplified causal model for conversation dynamics
+        self.causal_factors = {
+            'response_length': 'user_engagement',
+            'humor_usage': 'user_satisfaction', 
+            'question_asking': 'conversation_depth',
+            'technical_detail': 'user_interest',
+            'empathy_expression': 'user_comfort',
+            'topic_relevance': 'conversation_flow'
+        }
+        
+        # Store causal observations
+        self.observations = []
+        
+    def analyze_interaction(self, interaction: InteractionMemory) -> Dict[str, float]:
+        """Analyze what factors contributed to interaction quality"""
+        causal_scores = {}
+        
+        response = interaction.bot_response.lower()
+        user_input = interaction.user_input.lower()
+        quality = interaction.quality_score
+        
+        # Analyze response characteristics
+        word_count = len(interaction.bot_response.split())
+        question_count = interaction.bot_response.count('?')
+        humor_indicators = ['haha', 'lol', '😄', 'funny', 'joke']
+        humor_score = sum(1 for indicator in humor_indicators if indicator in response)
+        
+        # Map to causal factors
+        causal_scores['response_length'] = min(1.0, word_count / 50.0)
+        causal_scores['humor_usage'] = min(1.0, humor_score / 2.0)
+        causal_scores['question_asking'] = min(1.0, question_count / 2.0)
+        causal_scores['empathy_expression'] = self._detect_empathy(response)
+        causal_scores['topic_relevance'] = self._calculate_relevance(user_input, response)
+        
+        # Store observation for learning
+        self.observations.append({
+            'factors': causal_scores,
+            'outcome': quality,
+            'timestamp': interaction.timestamp
+        })
+        
+        return causal_scores
+    
+    def generate_counterfactual(self, interaction: InteractionMemory) -> List[str]:
+        """Generate counterfactual insights for improvement"""
+        counterfactuals = []
+        
+        causal_factors = self.analyze_interaction(interaction)
+        
+        # Suggest improvements based on causal analysis
+        if causal_factors['humor_usage'] < 0.3 and interaction.quality_score < 0.6:
+            counterfactuals.append("Could have been more engaging with appropriate humor")
+        
+        if causal_factors['question_asking'] < 0.2:
+            counterfactuals.append("Could have asked follow-up questions to deepen conversation")
+        
+        if causal_factors['empathy_expression'] < 0.3 and 'feel' in interaction.user_input.lower():
+            counterfactuals.append("Could have shown more empathy to emotional cues")
+        
+        if causal_factors['response_length'] > 0.8:
+            counterfactuals.append("Response might have been too lengthy")
+        
+        return counterfactuals
+    
+    def _detect_empathy(self, text: str) -> float:
+        """Simple empathy detection"""
+        empathy_words = [
+            'understand', 'feel', 'sorry', 'glad', 'appreciate', 
+            'difficult', 'challenging', 'excited', 'support'
+        ]
+        empathy_count = sum(1 for word in empathy_words if word in text)
+        return min(1.0, empathy_count / 3.0)
+    
+    def _calculate_relevance(self, user_input: str, response: str) -> float:
+        """Calculate topic relevance using simple word overlap"""
+        user_words = set(user_input.lower().split())
+        response_words = set(response.lower().split())
+        
+        # Remove common words
+        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should'}
+        user_words -= stop_words
+        response_words -= stop_words
+        
+        if len(user_words) == 0:
+            return 0.5
+        
+        overlap = len(user_words.intersection(response_words))
+        return min(1.0, overlap / len(user_words))
+
+class ProactiveEngagementPredictor:
+    """Initiative-taking with Inner Thoughts framework"""
+    
+    def __init__(self):
+        self.inner_thoughts = deque(maxlen=10)
+        self.engagement_history = []
+        self.topic_interests = defaultdict(float)
+        self.last_proactive_time = 0
+        self.proactive_cooldown = 300  # 5 minutes between proactive attempts
+        
+    def generate_inner_thought(self, context: str, conversation_history: List[InteractionMemory]) -> InnerThought:
+        """Generate internal reasoning about conversation state"""
+        
+        # Analyze conversation context
+        recent_topics = self._extract_recent_topics(conversation_history[-5:])
+        conversation_depth = len(conversation_history)
+        time_since_last = time.time() - (conversation_history[-1].timestamp if conversation_history else 0)
+        
+        # Generate different types of thoughts
+        thought_type = self._determine_thought_type(context, recent_topics, time_since_last)
+        
+        if thought_type == "curiosity":
+            content = self._generate_curiosity_thought(recent_topics, context)
+        elif thought_type == "clarification":
+            content = self._generate_clarification_thought(context)
+        elif thought_type == "topic_shift":
+            content = self._generate_topic_shift_thought(recent_topics)
+        elif thought_type == "emotional_response":
+            content = self._generate_emotional_thought(context)
+        else:
+            content = "I'm listening and processing the conversation."
+        
+        # Determine if thought should be expressed
+        should_express = self._should_express_thought(thought_type, time_since_last)
+        
+        thought = InnerThought(
+            timestamp=time.time(),
+            thought_type=thought_type,
+            content=content,
+            confidence=0.7,
+            triggers=[thought_type],
+            should_express=should_express
+        )
+        
+        self.inner_thoughts.append(thought)
+        return thought
+    
+    def should_initiate_conversation(self, context: Dict) -> Tuple[bool, str]:
+        """Decide whether to proactively start conversation"""
+        current_time = time.time()
+        
+        # Check cooldown
+        if current_time - self.last_proactive_time < self.proactive_cooldown:
+            return False, ""
+        
+        # Check if there are interesting topics to explore
+        interesting_topics = [
+            topic for topic, interest in self.topic_interests.items() 
+            if interest > 0.6
+        ]
+        
+        if not interesting_topics:
+            return False, ""
+        
+        # Generate proactive prompt based on recent activity
+        selected_topic = random.choice(interesting_topics)
+        prompts = [
+            f"I've been thinking about our discussion on {selected_topic}. What's your latest perspective on it?",
+            f"Something interesting came to mind about {selected_topic}. Want to explore it together?",
+            f"I'm curious about how your thoughts on {selected_topic} might have evolved recently.",
+        ]
+        
+        self.last_proactive_time = current_time
+        return True, random.choice(prompts)
+    
+    def _extract_recent_topics(self, interactions: List[InteractionMemory]) -> List[str]:
+        """Extract topics from recent interactions"""
+        topics = []
+        for interaction in interactions:
+            topics.extend(interaction.topics)
+        return list(set(topics))
+    
+    def _determine_thought_type(self, context: str, recent_topics: List[str], time_gap: float) -> str:
+        """Determine what type of inner thought to generate"""
+        context_lower = context.lower()
+        
+        if any(word in context_lower for word in ['why', 'how', 'what if', 'wonder']):
+            return "curiosity"
+        elif any(word in context_lower for word in ['unclear', 'confusing', 'not sure']):
+            return "clarification"
+        elif time_gap > 3600:  # 1 hour gap
+            return "topic_shift"
+        elif any(word in context_lower for word in ['feel', 'emotion', 'sad', 'happy', 'excited']):
+            return "emotional_response"
+        else:
+            return "general"
+    
+    def _generate_curiosity_thought(self, recent_topics: List[str], context: str) -> str:
+        """Generate curiosity-driven thought"""
+        if recent_topics:
+            topic = random.choice(recent_topics)
+            return f"I'm curious about the deeper implications of {topic}. There might be interesting connections to explore."
+        return "I wonder if there are aspects of this we haven't considered yet."
+    
+    def _generate_clarification_thought(self, context: str) -> str:
+        """Generate clarification-seeking thought"""
+        return "I sense there might be some ambiguity here. A clarifying question could help us both understand better."
+    
+    def _generate_topic_shift_thought(self, recent_topics: List[str]) -> str:
+        """Generate topic transition thought"""
+        return "It might be time to explore a new direction in our conversation, while building on what we've discussed."
+    
+    def _generate_emotional_thought(self, context: str) -> str:
+        """Generate emotionally-aware thought"""
+        return "I'm picking up on emotional context here. A thoughtful, empathetic response would be appropriate."
+    
+    def _should_express_thought(self, thought_type: str, time_gap: float) -> bool:
+        """Determine if inner thought should become external expression"""
+        # Express curiosity thoughts more often
+        if thought_type == "curiosity" and random.random() < 0.3:
+            return True
+        
+        # Express clarification when needed
+        if thought_type == "clarification" and random.random() < 0.5:
+            return True
+        
+        # Express topic shifts after long gaps
+        if thought_type == "topic_shift" and time_gap > 7200:  # 2 hours
+            return True
+        
+        return False
+
+class ReflectiveMemoryNexus:
+    """Enhanced memory system with reflection tags and weighted retrieval"""
+    
+    def __init__(self, config: Dict):
+        self.max_memories = config.get('max_memories', 1000)
+        self.embedding_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+        
+        # Memory storage
+        self.memories: Dict[str, InteractionMemory] = {}
+        self.embeddings = []
+        self.embedding_ids = []
+        
+        # Reflection system
+        self.reflection_tags = defaultdict(list)  # tag -> [memory_ids]
+        self.lesson_learned = {}  # memory_id -> lesson
+        
+        # Database for persistence
+        self.db_path = Path("personalens_memory.db")
+        self._init_database()
+        
+    def _init_database(self):
+        """Initialize enhanced database schema"""
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS interactions (
+                id TEXT PRIMARY KEY,
+                timestamp REAL,
+                user_input TEXT,
+                bot_response TEXT,
+                context TEXT,
+                user_feedback INTEGER,
+                quality_score REAL,
+                authenticity_score REAL,
+                topics TEXT,
+                reflection_tags TEXT,
+                personality_signals TEXT,
+                causal_factors TEXT,
+                counterfactual_notes TEXT,
+                was_proactive BOOLEAN,
+                proactive_success BOOLEAN,
+                input_embedding BLOB,
+                response_embedding BLOB
+            )
+        """)
+        
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS reflection_tags (
+                tag TEXT,
+                memory_id TEXT,
+                lesson TEXT,
+                timestamp REAL
+            )
+        """)
+        
+        conn.commit()
+        conn.close()
+    
+    def store_memory(self, memory: InteractionMemory) -> str:
+        """Store memory with reflection analysis"""
+        # Generate embeddings
+        memory.input_embedding = self.embedding_model.encode([memory.user_input])[0]
+        memory.response_embedding = self.embedding_model.encode([memory.bot_response])[0]
+        
+        # Store in memory dict
+        self.memories[memory.id] = memory
+        self.embeddings.append(memory.input_embedding)
+        self.embedding_ids.append(memory.id)
+        
+        # Process reflection tags
+        self._process_reflection_tags(memory)
+        
+        # Persist to database
+        self._persist_memory(memory)
+        
+        # Memory management
+        if len(self.memories) > self.max_memories:
+            self._prune_memories()
+        
+        logger.info(f"Stored memory {memory.id} with {len(memory.reflection_tags)} reflection tags")
+        return memory.id
+    
+    def retrieve_relevant_memories(self, query: str, k: int = 5, 
+                                 include_lessons: bool = True) -> List[Tuple[InteractionMemory, float]]:
+        """Retrieve memories with weighted scoring"""
+        if not self.embeddings:
+            return []
+        
+        # Generate query embedding
+        query_embedding = self.embedding_model.encode([query])
+        
+        # Calculate similarities
+        similarities = cosine_similarity(query_embedding, self.embeddings)[0]
+        
+        # Calculate weighted scores
+        scored_memories = []
+        current_time = time.time()
+        
+        for i, (memory_id, similarity) in enumerate(zip(self.embedding_ids, similarities)):
+            if memory_id not in self.memories:
+                continue
+                
+            memory = self.memories[memory_id]
+            
+            # Base similarity score
+            score = similarity
+            
+            # Boost recent memories
+            age_days = (current_time - memory.timestamp) / 86400
+            recency_boost = max(0, 1 - (age_days / 30))  # Decay over 30 days
+            score += recency_boost * 0.1
+            
+            # Boost memories with strong feedback
+            if memory.user_feedback == 1:
+                score += 0.2
+            elif memory.user_feedback == -1:
+                score += 0.1  # Negative feedback is also informative
+            
+            # Boost high-quality memories
+            score += memory.quality_score * 0.1
+            
+            scored_memories.append((memory, score))
+        
+        # Sort by score and return top k
+        scored_memories.sort(key=lambda x: x[1], reverse=True)
+        results = scored_memories[:k]
+        
+        # Include relevant lessons learned
+        if include_lessons:
+            for memory, score in results:
+                if memory.id in self.lesson_learned:
+                    memory.reflection_tags.append(f"Lesson: {self.lesson_learned[memory.id]}")
+        
+        return results
+    
+    def add_reflection_tag(self, memory_id: str, tag: str, lesson: str = ""):
+        """Add reflection tag to memory"""
+        if memory_id in self.memories:
+            self.memories[memory_id].reflection_tags.append(tag)
+            self.reflection_tags[tag].append(memory_id)
+            
+            if lesson:
+                self.lesson_learned[memory_id] = lesson
+            
+            # Persist reflection
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("""
+                INSERT INTO reflection_tags (tag, memory_id, lesson, timestamp)
+                VALUES (?, ?, ?, ?)
+            """, (tag, memory_id, lesson, time.time()))
+            conn.commit()
+            conn.close()
+    
+    def _process_reflection_tags(self, memory: InteractionMemory):
+        """Automatically generate reflection tags"""
+        # Tag based on feedback
+        if memory.user_feedback == -1:
+            memory.reflection_tags.append("needs_improvement")
+        elif memory.user_feedback == 1:
+            memory.reflection_tags.append("successful_pattern")
+        
+        # Tag based on quality
+        if memory.quality_score < 0.4:
+            memory.reflection_tags.append("low_quality")
+        elif memory.quality_score > 0.8:
+            memory.reflection_tags.append("high_quality")
+        
+        # Tag based on authenticity
+        if memory.authenticity_score > 0.8:
+            memory.reflection_tags.append("authentic_voice")
+        
+        # Tag proactive interactions
+        if memory.was_proactive:
+            if memory.proactive_success:
+                memory.reflection_tags.append("successful_proactive")
+            else:
+                memory.reflection_tags.append("failed_proactive")
+    
+    def _persist_memory(self, memory: InteractionMemory):
+        """Persist memory to database"""
+        conn = sqlite3.connect(self.db_path)
+        
+        conn.execute("""
+            INSERT OR REPLACE INTO interactions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            memory.id, memory.timestamp, memory.user_input, memory.bot_response,
+            json.dumps(memory.context), memory.user_feedback, memory.quality_score,
+            memory.authenticity_score, json.dumps(memory.topics),
+            json.dumps(memory.reflection_tags), json.dumps(memory.personality_signals),
+            json.dumps(memory.causal_factors), json.dumps(memory.counterfactual_notes),
+            memory.was_proactive, memory.proactive_success,
+            memory.input_embedding.tobytes(), memory.response_embedding.tobytes()
+        ))
+        
+        conn.commit()
+        conn.close()
+    
+    def _prune_memories(self):
+        """Intelligent memory pruning"""
+        # Score memories for retention
+        current_time = time.time()
+        scored_memories = []
+        
+        for memory in self.memories.values():
+            # Base score from quality and feedback
+            score = memory.quality_score
+            if memory.user_feedback == 1:
+                score += 0.3
+            elif memory.user_feedback == -1:
+                score += 0.1  # Keep some negative examples
+            
+            # Recency factor
+            age_days = (current_time - memory.timestamp) / 86400
+            recency_factor = max(0.1, 1 - (age_days / 90))  # Decay over 90 days
+            score *= recency_factor
+            
+            # Boost memories with reflection tags
+            score += len(memory.reflection_tags) * 0.05
+            
+            scored_memories.append((memory.id, score))
+        
+        # Keep top 80% of memories
+        scored_memories.sort(key=lambda x: x[1], reverse=True)
+        keep_count = int(self.max_memories * 0.8)
+        
+        memories_to_remove = [mid for mid, _ in scored_memories[keep_count:]]
+        
+        # Remove from storage
+        for memory_id in memories_to_remove:
+            if memory_id in self.memories:
+                del self.memories[memory_id]
+        
+        # Rebuild embeddings list
+        self.embeddings = []
+        self.embedding_ids = []
+        for memory_id, memory in self.memories.items():
+            self.embeddings.append(memory.input_embedding)
+            self.embedding_ids.append(memory_id)
+        
+        logger.info(f"Pruned {len(memories_to_remove)} memories, kept {len(self.memories)}")
+
+class AuthenticQualityAssessor:
+    """User-centric quality evaluation with authenticity focus"""
+    
+    def __init__(self):
+        self.safety_model = Detoxify('original')
+        
+        # Quality dimensions with learnable weights
+        self.quality_weights = {
+            'relevance': 0.25,
+            'authenticity': 0.25,
+            'engagement': 0.20,
+            'helpfulness': 0.15,
+            'safety': 0.15
+        }
+        
+        # Historical quality patterns
+        self.quality_history = []
+        
+    def assess_interaction(self, memory: InteractionMemory, personality: PersonalityProfile) -> Tuple[float, float]:
+        """Assess quality and authenticity of interaction"""
+        
+        # Component assessments
+        relevance = self._assess_relevance(memory.user_input, memory.bot_response)
+        authenticity = self._assess_authenticity(memory.bot_response, personality)
+        engagement = self._assess_engagement(memory.user_input, memory.bot_response)
+        helpfulness = self._assess_helpfulness(memory.user_input, memory.bot_response)
+        safety = self._assess_safety(memory.bot_response)
+        
+        # Weighted overall quality
+        quality_score = (
+            relevance * self.quality_weights['relevance'] +
+            authenticity * self.quality_weights['authenticity'] +
+            engagement * self.quality_weights['engagement'] +
+            helpfulness * self.quality_weights['helpfulness'] +
+            safety * self.quality_weights['safety']
+        )
+        
+        # Store assessment for learning
+        self.quality_history.append({
+            'timestamp': memory.timestamp,
+            'relevance': relevance,
+            'authenticity': authenticity,
+            'engagement': engagement,
+            'helpfulness': helpfulness,
+            'safety': safety,
+            'overall': quality_score,
+            'user_feedback': memory.user_feedback
+        })
+        
+        return quality_score, authenticity
+    
+    def update_weights_from_feedback(self):
+        """Learn quality weights from user feedback patterns"""
+        if len(self.quality_history) < 20:
+            return
+        
+        # Analyze which dimensions correlate with positive feedback
+        positive_feedbacks = [h for h in self.quality_history if h.get('user_feedback') == 1]
+        negative_feedbacks = [h for h in self.quality_history if h.get('user_feedback') == -1]
+        
+        if len(positive_feedbacks) < 5 or len(negative_feedbacks) < 5:
+            return
+        
+        # Calculate correlation between dimensions and feedback
+        dimensions = ['relevance', 'authenticity', 'engagement', 'helpfulness', 'safety']
+        
+        for dim in dimensions:
+            pos_scores = [h[dim] for h in positive_feedbacks]
+            neg_scores = [h[dim] for h in negative_feedbacks]
+            
+            pos_mean = np.mean(pos_scores)
+            neg_mean = np.mean(neg_scores)
+            
+            # Adjust weight based on discriminative power
+            discriminative_power = abs(pos_mean - neg_mean)
+            adjustment = discriminative_power * 0.1
+            
+            if pos_mean > neg_mean:
+                self.quality_weights[dim] = min(0.5, self.quality_weights[dim] + adjustment)
+            else:
+                self.quality_weights[dim] = max(0.05, self.quality_weights[dim] - adjustment)
+        
+        # Normalize weights
+        total_weight = sum(self.quality_weights.values())
+        for dim in dimensions:
+            self.quality_weights[dim] /= total_weight
+        
+        logger.info(f"Updated quality weights: {self.quality_weights}")
+    
+    def _assess_relevance(self, user_input: str, bot_response: str) -> float:
+        """Assess topic relevance"""
+        user_words = set(user_input.lower().split())
+        response_words = set(bot_response.lower().split())
+        
+        # Remove stop words
+        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with'}
+        user_words -= stop_words
+        response_words -= stop_words
+        
+        if len(user_words) == 0:
+            return 0.5
+        
+        overlap = len(user_words.intersection(response_words))
+        return min(1.0, overlap / len(user_words) * 2)
+    
+    def _assess_authenticity(self, response: str, personality: PersonalityProfile) -> float:
+        """Assess how well response matches learned personality"""
+        authenticity_score = 0.0
+        
+        # Check humor alignment
+        humor_present = any(indicator in response.lower() for indicator in ['haha', 'lol', 'funny', '😄'])
+        if humor_present and personality.humor_level > 0.6:
+            authenticity_score += 0.2
+        elif not humor_present and personality.humor_level < 0.4:
+            authenticity_score += 0.1
+        
+        # Check verbosity alignment
+        word_count = len(response.split())
+        expected_length = personality.verbosity * 100
+        length_diff = abs(word_count - expected_length) / expected_length
+        length_score = max(0, 1 - length_diff)
+        authenticity_score += length_score * 0.2
+        
+        # Check question frequency
+        question_count = response.count('?')
+        if question_count > 0 and personality.question_frequency > 0.6:
+            authenticity_score += 0.2
+        elif question_count == 0 and personality.question_frequency < 0.4:
+            authenticity_score += 0.1
+        
+        # Check formality
+        formal_words = ['however', 'therefore', 'furthermore', 'nevertheless']
+        formal_count = sum(1 for word in formal_words if word in response.lower())
+        if formal_count > 0 and personality.formality > 0.6:
+            authenticity_score += 0.2
+        elif formal_count == 0 and personality.formality < 0.4:
+            authenticity_score += 0.2
+        
+        # Baseline authenticity
+        authenticity_score += 0.2
+        
+        return min(1.0, authenticity_score)
+    
+    def _assess_engagement(self, user_input: str, bot_response: str) -> float:
+        """Assess conversational engagement"""
+        engagement_score = 0.0
+        
+        # Response length (not too short, not too long)
+        word_count = len(bot_response.split())
+        if 10 <= word_count <= 100:
+            engagement_score += 0.3
+        elif 5 <= word_count <= 150:
+            engagement_score += 0.2
+        else:
+            engagement_score += 0.1
+        
+        # Question asking
+        if '?' in bot_response:
+            engagement_score += 0.2
+        
+        # Personal pronouns (engagement indicators)
+        personal_pronouns = ['you', 'your', 'we', 'us', 'our', 'i', 'my']
+        pronoun_count = sum(1 for word in bot_response.lower().split() if word in personal_pronouns)
+        engagement_score += min(0.3, pronoun_count * 0.1)
+        
+        # Emotional words
+        emotional_words = ['excited', 'interested', 'curious', 'fascinated', 'love', 'enjoy']
+        emotion_count = sum(1 for word in emotional_words if word in bot_response.lower())
+        engagement_score += min(0.2, emotion_count * 0.1)
+        
+        return min(1.0, engagement_score)
+    
+    def _assess_helpfulness(self, user_input: str, bot_response: str) -> float:
+        """Assess response helpfulness"""
+        helpful_indicators = [
+            'here', 'you can', 'try', 'consider', 'suggest', 'recommend',
+            'solution', 'answer', 'explain', 'because', 'let me', 'i can help'
+        ]
+        
+        unhelpful_indicators = [
+            "i don't know", "not sure", "unclear", "can't help"
+        ]
+        
+        response_lower = bot_response.lower()
+        
+        helpful_count = sum(1 for indicator in helpful_indicators if indicator in response_lower)
+        unhelpful_count = sum(1 for indicator in unhelpful_indicators if indicator in response_lower)
+        
+        base_score = (helpful_count - unhelpful_count) / max(1, len(helpful_indicators))
+        
+        # Adjust for response appropriateness
+        if '?' in user_input and len(bot_response.split()) > 5:
+            base_score += 0.2  # Good for answering questions
+        
+        return max(0, min(1, base_score + 0.5))
+    
+    def _assess_safety(self, response: str) -> float:
+        """Assess response safety"""
+        try:
+            toxicity_scores = self.safety_model.predict([response])
+            max_toxicity = max([
+                toxicity_scores['toxicity'][0],
+                toxicity_scores['severe_toxicity'][0],
+                toxicity_scores['obscene'][0],
+                toxicity_scores['threat'][0],
+                toxicity_scores['insult'][0],
+                toxicity_scores['identity_attack'][0]
+            ])
+            return max(0, min(1, 1 - max_toxicity))
+        except:
+            # Fallback safety check
+            unsafe_words = ['hate', 'stupid', 'idiot', 'terrible', 'awful']
+            response_lower = response.lower()
+            unsafe_count = sum(1 for word in unsafe_words if word in response_lower)
+            return max(0, 1 - (unsafe_count * 0.2))
+
+class SelfCorrectionController:
+    """Learning from mistakes with targeted adjustments"""
+    
+    def __init__(self):
+        self.correction_examples = []
+        self.improvement_patterns = defaultdict(list)
+        
+    def process_negative_feedback(self, memory: InteractionMemory, 
+                                correction_hint: str = "") -> Dict[str, Any]:
+        """Process negative feedback and generate correction strategy"""
+        
+        correction_data = {
+            'memory_id': memory.id,
+            'timestamp': time.time(),
+            'user_input': memory.user_input,
+            'problematic_response': memory.bot_response,
+            'correction_hint': correction_hint,
+            'suggested_improvements': []
+        }
+        
+        # Analyze what went wrong
+        issues = self._diagnose_issues(memory)
+        correction_data['diagnosed_issues'] = issues
+        
+        # Generate specific improvement suggestions
+        for issue in issues:
+            improvement = self._generate_improvement_suggestion(issue, memory)
+            if improvement:
+                correction_data['suggested_improvements'].append(improvement)
+        
+        # Store for learning
+        self.correction_examples.append(correction_data)
+        
+        # Update improvement patterns
+        for issue in issues:
+            self.improvement_patterns[issue].append({
+                'context': memory.user_input,
+                'bad_response': memory.bot_response,
+                'timestamp': time.time()
+            })
+        
+        return correction_data
+    
+    def generate_corrected_response(self, memory: InteractionMemory, 
+                                  correction_hint: str) -> str:
+        """Generate an improved response based on correction hint"""
+        
+        # Extract specific guidance from hint
+        if "more concise" in correction_hint.lower():
+            # Shorten the response
+            sentences = memory.bot_response.split('. ')
+            shortened = '. '.join(sentences[:max(1, len(sentences)//2)])
+            return shortened + '.'
+        
+        elif "more detail" in correction_hint.lower():
+            # Add explanatory phrase
+            return memory.bot_response + " Let me elaborate on that further if you'd like."
+        
+        elif "less formal" in correction_hint.lower():
+            # Make more casual
+            casual_response = memory.bot_response.replace("However,", "But")
+            casual_response = casual_response.replace("Therefore,", "So")
+            casual_response = casual_response.replace("Furthermore,", "Also")
+            return casual_response
+        
+        elif "more empathetic" in correction_hint.lower():
+            # Add empathetic elements
+            empathy_prefixes = [
+                "I understand that ",
+                "That sounds like ",
+                "I can see why "
+            ]
+            prefix = random.choice(empathy_prefixes)
+            return prefix + memory.bot_response.lower()
+        
+        else:
+            # General improvement
+            return f"Let me rephrase that: {memory.bot_response}"
+    
+    def get_improvement_guidance(self, current_context: str) -> List[str]:
+        """Get guidance based on past correction patterns"""
+        guidance = []
+        
+        # Check for common patterns in current context
+        context_lower = current_context.lower()
+        
+        # Look for similar past issues
+        for issue_type, examples in self.improvement_patterns.items():
+            if len(examples) >= 3:  # Pattern established
+                recent_examples = examples[-5:]  # Check recent examples
+                
+                if any(word in context_lower for word in ['feel', 'emotion', 'sad', 'upset']):
+                    if issue_type == 'low_empathy':
+                        guidance.append("Remember to show empathy in emotional contexts")
+                
+                if len(current_context.split()) > 50:  # Long input
+                    if issue_type == 'too_verbose':
+                        guidance.append("User prefers concise responses in complex topics")
+                
+                if '?' in current_context:  # Question
+                    if issue_type == 'not_helpful':
+                        guidance.append("Provide direct, actionable answers to questions")
+        
+        return guidance
+    
+    def _diagnose_issues(self, memory: InteractionMemory) -> List[str]:
+        """Diagnose what went wrong with the response"""
+        issues = []
+        
+        response = memory.bot_response
+        user_input = memory.user_input
+        
+        # Check for common issues
+        if len(response.split()) > 100:
+            issues.append('too_verbose')
+        
+        if len(response.split()) < 5:
+            issues.append('too_brief')
+        
+        # Check for repetition
+        words = response.lower().split()
+        if len(set(words)) / len(words) < 0.7:  # Low uniqueness
+            issues.append('repetitive')
+        
+        # Check for empathy in emotional contexts
+        if any(word in user_input.lower() for word in ['feel', 'sad', 'upset', 'frustrated']):
+            empathy_words = ['understand', 'sorry', 'feel', 'difficult']
+            if not any(word in response.lower() for word in empathy_words):
+                issues.append('low_empathy')
+        
+        # Check for helpfulness in question contexts
+        if '?' in user_input and not any(word in response.lower() for word in ['can', 'try', 'suggest', 'help']):
+            issues.append('not_helpful')
+        
+        # Check relevance
+        user_words = set(user_input.lower().split())
+        response_words = set(response.lower().split())
+        overlap = len(user_words.intersection(response_words))
+        if overlap / max(len(user_words), 1) < 0.2:
+            issues.append('off_topic')
+        
+        return issues
+    
+    def _generate_improvement_suggestion(self, issue: str, memory: InteractionMemory) -> str:
+        """Generate specific improvement suggestion for diagnosed issue"""
+        suggestions = {
+            'too_verbose': "Try to be more concise while maintaining key information",
+            'too_brief': "Provide more detail and explanation in your response",
+            'repetitive': "Use more varied vocabulary and avoid repeating concepts",
+            'low_empathy': "Acknowledge emotions and show understanding in your response",
+            'not_helpful': "Provide specific, actionable advice or information",
+            'off_topic': "Stay more focused on the user's specific question or concern"
+        }
+        
+        return suggestions.get(issue, "Consider how to better address the user's needs")
+
+class PersonaLensEvo:
+    """Main orchestrator for the PersonaLens-Evo system"""
+    
+    def __init__(self, config: Dict = None):
+        # Configuration
+        self.config = config or {
+            'base_model': 'microsoft/DialoGPT-medium',
+            'max_memories': 1000,
+            'fine_tune_threshold': 20,
+            'learning_rate': 5e-5,
+            'proactive_cooldown': 300
+        }
+        
+        # Initialize components
+        self.core_model = AdaptiveCoreLanguageModel(self.config['base_model'])
+        self.causal_engine = CausalReflectionEngine()
+        self.proactive_predictor = ProactiveEngagementPredictor()
+        self.memory_nexus = ReflectiveMemoryNexus(self.config)
+        self.quality_assessor = AuthenticQualityAssessor()
+        self.correction_controller = SelfCorrectionController()
+        
+        # State
+        self.personality = PersonalityProfile()
+        self.conversation_count = 0
+        self.last_evolution = 0
+        
+        # Topic extraction
+        self.topic_extractor = pipeline("zero-shot-classification", 
+                                       model="facebook/bart-large-mnli")
+        self.candidate_topics = [
+            "work", "technology", "family", "hobbies", "food", "travel", 
+            "science", "art", "music", "sports", "politics", "philosophy",
+            "health", "education", "relationships", "creativity"
+        ]
+        
+        logger.info("PersonaLens-Evo initialized successfully")
+    
+    def chat(self, user_input: str, context: List[str] = None) -> Tuple[str, Dict]:
+        """Main chat interface with full learning pipeline"""
+        context = context or []
+        
+        # Generate inner thought
+        recent_memories = list(self.memory_nexus.memories.values())[-10:]
+        inner_thought = self.proactive_predictor.generate_inner_thought(user_input, recent_memories)
+        
+        # Retrieve relevant memories
+        relevant_memories = self.memory_nexus.retrieve_relevant_memories(user_input, k=5)
+        
+        # Build enhanced context
+        memory_context = []
+        for memory, score in relevant_memories:
+            memory_context.append(f"Previous: {memory.user_input} -> {memory.bot_response}")
+        
+        # Get improvement guidance
+        guidance = self.correction_controller.get_improvement_guidance(user_input)
+        
+        # Generate response
+        full_context = context + memory_context + [user_input]
+        response = self.core_model.generate_response(
+            "\n".join(full_context), 
+            self.personality
+        )
+        
+        # Extract topics
+        topics = self._extract_topics(user_input)
+        
+        # Update topic interests
+        for topic in topics:
+            self.proactive_predictor.topic_interests[topic] = min(1.0, 
+                self.proactive_predictor.topic_interests[topic] + 0.1)
+        
+        # Create interaction memory
+        memory = InteractionMemory(
+            id=f"mem_{int(time.time() * 1000)}_{hash(user_input) % 10000}",
+            timestamp=time.time(),
+            user_input=user_input,
+            bot_response=response,
+            context=context,
+            topics=topics,
+            was_proactive=False
+        )
+        
+        # Quality assessment
+        quality_score, authenticity_score = self.quality_assessor.assess_interaction(memory, self.personality)
+        memory.quality_score = quality_score
+        memory.authenticity_score = authenticity_score
+        
+        # Causal analysis
+        causal_factors = self.causal_engine.analyze_interaction(memory)
+        memory.causal_factors = causal_factors
+        
+        # Generate counterfactuals
+        counterfactuals = self.causal_engine.generate_counterfactual(memory)
+        memory.counterfactual_notes = counterfactuals
+        
+        # Extract personality signals
+        personality_signals = self._extract_personality_signals(response)
+        memory.personality_signals = personality_signals
+        
+        # Update personality
+        self._update_personality_from_signals(personality_signals, quality_score)
+        
+        # Store memory
+        memory_id = self.memory_nexus.store_memory(memory)
+        
+        # Add to training data if high quality
+        if quality_score > 0.7:
+            self.core_model.add_training_example(user_input, response, quality_score)
+        
+        # Trigger evolution if needed
+        self.conversation_count += 1
+        if self.conversation_count % self.config['fine_tune_threshold'] == 0:
+            self._trigger_evolution()
+        
+        # Check for proactive engagement
+        proactive_prompt = None
+        if inner_thought.should_express:
+            if inner_thought.thought_type == "curiosity":
+                proactive_prompt = f"💭 {inner_thought.content}"
+            elif inner_thought.thought_type == "clarification":
+                proactive_prompt = f"🤔 {inner_thought.content}"
+        
+        # Compile metadata
+        metadata = {
+            'memory_id': memory_id,
+            'quality_score': quality_score,
+            'authenticity_score': authenticity_score,
+            'personality_traits': asdict(self.personality),
+            'causal_factors': causal_factors,
+            'counterfactuals': counterfactuals,
+            'inner_thought': asdict(inner_thought),
+            'proactive_prompt': proactive_prompt,
+            'relevant_memories': len(relevant_memories),
+            'improvement_guidance': guidance,
+            'topics': topics
+        }
+        
+        return response, metadata
+    
+    def provide_feedback(self, rating: int, correction_hint: str = ""):
+        """Provide feedback on last interaction"""
+        if not self.memory_nexus.memories:
+            return
+        
+        # Get last memory
+        last_memory_id = max(self.memory_nexus.memories.keys(), 
+                           key=lambda x: self.memory_nexus.memories[x].timestamp)
+        last_memory = self.memory_nexus.memories[last_memory_id]
+        
+        # Update feedback
+        last_memory.user_feedback = rating
+        
+        # Process correction if negative feedback
+        if rating == -1 and correction_hint:
+            correction_data = self.correction_controller.process_negative_feedback(
+                last_memory, correction_hint
+            )
+            
+            # Add reflection tag
+            self.memory_nexus.add_reflection_tag(
+                last_memory_id, 
+                "user_correction", 
+                correction_hint
+            )
+            
+            # Generate corrected response for learning
+            corrected_response = self.correction_controller.generate_corrected_response(
+                last_memory, correction_hint
+            )
+            
+            # Store as training example
+            self.core_model.add_training_example(
+                last_memory.user_input, 
+                corrected_response, 
+                0.9  # High quality for corrected responses
+            )
+            
+            logger.info(f"Processed correction: {correction_hint}")
+        
+        # Update quality weights
+        self.quality_assessor.update_weights_from_feedback()
+        
+        logger.info(f"Feedback recorded: {'positive' if rating > 0 else 'negative'}")
+    
+    def initiate_proactive_conversation(self) -> Tuple[bool, str]:
+        """Try to start a proactive conversation"""
+        context = {
+            'recent_topics': list(self.proactive_predictor.topic_interests.keys()),
+            'conversation_count': self.conversation_count,
+            'time_since_last': time.time() - (max(
+                [m.timestamp for m in self.memory_nexus.memories.values()], 
+                default=0
+            ))
+        }
+        
+        should_initiate, prompt = self.proactive_predictor.should_initiate_conversation(context)
+        
+        if should_initiate:
+            # Create proactive interaction memory
+            memory = InteractionMemory(
+                id=f"proactive_{int(time.time() * 1000)}",
+                timestamp=time.time(),
+                user_input="[PROACTIVE_INITIATION]",
+                bot_response=prompt,
+                context=[],
+                was_proactive=True
+            )
+            
+            # Store memory
+            self.memory_nexus.store_memory(memory)
+            logger.info(f"Initiated proactive conversation: {prompt}")
+        
+        return should_initiate, prompt
+    
+    def _trigger_evolution(self):
+        """Trigger model evolution through fine-tuning"""
+        logger.info("🧠 Triggering evolution cycle...")
+        
+        # Get recent interactions for fine-tuning
+        recent_memories = [
+            m for m in self.memory_nexus.memories.values()
+            if time.time() - m.timestamp < 7 * 24 * 3600  # Last week
+        ]
+        
+        # Fine-tune model
+        success = self.core_model.fine_tune_on_interactions(recent_memories)
+        
+        if success:
+            self.last_evolution = time.time()
+            logger.info("✅ Evolution cycle completed successfully")
+        else:
+            logger.warning("⚠️ Evolution cycle failed")
+    
+    def _extract_topics(self, text: str) -> List[str]:
+        """Extract topics from text using zero-shot classification"""
+        try:
+            result = self.topic_extractor(text, self.candidate_topics)
+            # Return topics with confidence > 0.3
+            topics = [
+                result['labels'][i] for i, score in enumerate(result['scores'])
+                if score > 0.3
+            ]
+            return topics[:3]  # Max 3 topics
+        except:
+            # Fallback to keyword matching
+            text_lower = text.lower()
+            detected_topics = []
+            for topic in self.candidate_topics:
+                if topic in text_lower:
+                    detected_topics.append(topic)
+            return detected_topics[:3]
+    
+    def _extract_personality_signals(self, response: str) -> Dict[str, float]:
+        """Extract personality signals from response"""
+        signals = {}
+        
+        # Humor detection
+        humor_indicators = ['haha', 'lol', '😄', 'funny', 'joke', 'hilarious']
+        humor_count = sum(1 for indicator in humor_indicators if indicator in response.lower())
+        signals['humor_level'] = min(1.0, humor_count / 2.0)
+        
+        # Technical depth
+        technical_words = ['algorithm', 'system', 'process', 'method', 'analysis', 'implementation']
+        tech_count = sum(1 for word in technical_words if word in response.lower())
+        signals['technical_depth'] = min(1.0, tech_count / 3.0)
+        
+        # Question frequency
+        question_count = response.count('?')
+        signals['question_frequency'] = min(1.0, question_count / 2.0)
+        
+        # Enthusiasm
+        enthusiasm_words = ['excited', 'amazing', 'fantastic', 'wonderful', 'love', 'awesome']
+        enthusiasm_count = sum(1 for word in enthusiasm_words if word in response.lower())
+        signals['enthusiasm'] = min(1.0, enthusiasm_count / 2.0)
+        
+        # Empathy
+        empathy_words = ['understand', 'feel', 'sorry', 'appreciate', 'support']
+        empathy_count = sum(1 for word in empathy_words if word in response.lower())
+        signals['empathy'] = min(1.0, empathy_count / 2.0)
+        
+        # Formality
+        formal_words = ['however', 'therefore', 'furthermore', 'consequently']
+        formal_count = sum(1 for word in formal_words if word in response.lower())
+        signals['formality'] = min(1.0, formal_count / 2.0)
+        
+        # Verbosity
+        word_count = len(response.split())
+        signals['verbosity'] = min(1.0, word_count / 100.0)
+        
+        # Curiosity
+        curiosity_words = ['wonder', 'curious', 'interesting', 'explore', 'discover']
+        curiosity_count = sum(1 for word in curiosity_words if word in response.lower())
+        signals['curiosity'] = min(1.0, curiosity_count / 2.0)
+        
+        return signals
+    
+    def _update_personality_from_signals(self, signals: Dict[str, float], quality_score: float):
+        """Update personality based on response signals and quality"""
+        # Only update if response was successful
+        if quality_score > 0.6:
+            confidence = quality_score  # Use quality as confidence
+            
+            for trait, value in signals.items():
+                if hasattr(self.personality, trait):
+                    self.personality.update_trait(trait, value, confidence)
+    
+    def get_system_stats(self) -> Dict:
+        """Get comprehensive system statistics"""
+        current_time = time.time()
+        
+        # Memory stats
+        memory_stats = {
+            'total_memories': len(self.memory_nexus.memories),
+            'positive_feedback': len([m for m in self.memory_nexus.memories.values() if m.user_feedback == 1]),
+            'negative_feedback': len([m for m in self.memory_nexus.memories.values() if m.user_feedback == -1]),
+            'high_quality': len([m for m in self.memory_nexus.memories.values() if m.quality_score > 0.7]),
+            'reflection_tags': len(self.memory_nexus.reflection_tags)
+        }
+        
+        # Personality evolution
+        personality_stats = {
+            'current_traits': asdict(self.personality),
+            'confidence_scores': self.personality.confidence_scores,
+            'trait_stability': self._calculate_trait_stability()
+        }
+        
+        # Learning stats
+        learning_stats = {
+            'conversation_count': self.conversation_count,
+            'last_evolution': self.last_evolution,
+            'training_examples': len(self.core_model.training_data),
+            'causal_observations': len(self.causal_engine.observations),
+            'correction_examples': len(self.correction_controller.correction_examples)
+        }
+        
+        # Proactive engagement
+        proactive_stats = {
+            'topic_interests': dict(self.proactive_predictor.topic_interests),
+            'inner_thoughts': len(self.proactive_predictor.inner_thoughts),
+            'proactive_attempts': len([m for m in self.memory_nexus.memories.values() if m.was_proactive])
+        }
+        
+        return {
+            'system_uptime': current_time - (min([m.timestamp for m in self.memory_nexus.memories.values()], default=current_time)),
+            'memory': memory_stats,
+            'personality': personality_stats,
+            'learning': learning_stats,
+            'proactive': proactive_stats,
+            'quality_weights': self.quality_assessor.quality_weights
+        }
+    
+    def _calculate_trait_stability(self) -> Dict[str, float]:
+        """Calculate how stable each personality trait is"""
+        stability_scores = {}
+        
+        for trait in ['humor_level', 'technical_depth', 'question_frequency', 'enthusiasm', 'empathy', 'formality', 'verbosity', 'curiosity']:
+            if trait in self.personality.trait_history:
+                history = self.personality.trait_history[trait]
+                if len(history) > 5:
+                    values = [v for t, v in history]
+                    stability = 1.0 - np.std(values)  # Lower std = higher stability
+                    stability_scores[trait] = max(0, stability)
+                else:
+                    stability_scores[trait] = 0.5  # Default for insufficient data
+            else:
+                stability_scores[trait] = 1.0  # No changes = very stable
+        
+        return stability_scores
+
+def main():
+    """Demo the PersonaLens-Evo system"""
+    print("🧠 PersonaLens-Evo: Advanced Self-Evolving Personal Chatbot")
+    print("=" * 60)
+    print("Features:")
+    print("- LoRA-based core model fine-tuning")
+    print("- Causal reflection and counterfactual analysis")
+    print("- Proactive engagement with inner thoughts")
+    print("- Reflective memory with weighted retrieval")
+    print("- Authentic quality assessment with learnable weights")
+    print("- Self-correction from negative feedback")
+    print("- Dynamic personality evolution")
+    print("-" * 60)
+    
+    # Initialize system
+    config = {
+        'base_model': 'microsoft/DialoGPT-medium',
+        'max_memories': 1000,
+        'fine_tune_threshold': 10,  # Smaller for demo
+        'learning_rate': 5e-5,
+        'proactive_cooldown': 60  # 1 minute for demo
+    }
+    
+    bot = PersonaLensEvo(config)
+    
+    print("💬 Chat with PersonaLens-Evo! Commands:")
+    print("  'stats' - Show system statistics")
+    print("  'proactive' - Try proactive conversation initiation")
+    print("  '+' - Rate last response as good")
+    print("  '- [hint]' - Rate last response as bad with correction hint")
+    print("  'evolve' - Trigger evolution cycle")
+    print("  'personality' - Show current personality profile")
+    print("  'quit' - Exit")
+    print()
+    
+    while True:
+        try:
+            user_input = input("\n🧑 You: ").strip()
+            
+            if not user_input:
+                continue
+            
+            if user_input.lower() == 'quit':
+                break
+            elif user_input.lower() == 'stats':
+                stats = bot.get_system_stats()
+                print(f"\n📊 System Statistics:")
+                for category, data in stats.items():
+                    print(f"\n{category.upper()}:")
+                    if isinstance(data, dict):
+                        for key, value in data.items():
+                            if isinstance(value, float):
+                                print(f"  {key}: {value:.3f}")
+                            else:
+                                print(f"  {key}: {value}")
+                    else:
+                        print(f"  {data}")
+                continue
+            elif user_input.lower() == 'proactive':
+                should_initiate, prompt = bot.initiate_proactive_conversation()
+                if should_initiate:
+                    print(f"\n🤖 PersonaLens-Evo: {prompt}")
+                else:
+                    print("\n💭 Not ready for proactive conversation yet")
+                continue
+            elif user_input == '+':
+                bot.provide_feedback(1)
+                print("👍 Positive feedback recorded")
+                continue
+            elif user_input.startswith('- '):
+                correction_hint = user_input[2:].strip()
+                bot.provide_feedback(-1, correction_hint)
+                print(f"👎 Negative feedback with correction: {correction_hint}")
+                continue
+            elif user_input == '-':
+                bot.provide_feedback(-1)
+                print("👎 Negative feedback recorded")
+                continue
+            elif user_input.lower() == 'evolve':
+                bot._trigger_evolution()
+                print("🧠 Evolution cycle triggered")
+                continue
+            elif user_input.lower() == 'personality':
+                personality = asdict(bot.personality)
+                print(f"\n👤 Current Personality Profile:")
+                for trait, value in personality.items():
+                    if isinstance(value, float):
+                        print(f"  {trait}: {value:.3f}")
+                continue
+            
+            # Generate response
+            response, metadata = bot.chat(user_input)
+            
+            # Display response
+            print(f"\n🤖 PersonaLens-Evo: {response}")
+            
+            # Show metadata
+            print(f"\n📋 Quality: {metadata['quality_score']:.3f} | "
+                  f"Authenticity: {metadata['authenticity_score']:.3f} | "
+                  f"Topics: {', '.join(metadata['topics']) if metadata['topics'] else 'None'}")
+            
+            # Show proactive prompt if available
+            if metadata.get('proactive_prompt'):
+                print(f"\n{metadata['proactive_prompt']}")
+            
+            # Show improvement guidance
+            if metadata.get('improvement_guidance'):
+                print(f"\n💡 Guidance: {'; '.join(metadata['improvement_guidance'])}")
+            
+        except KeyboardInterrupt:
+            print("\n👋 Goodbye!")
+            break
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            logger.error(f"Error in main loop: {e}")
+    
+    # Final stats
+    print("\n🎯 Final System Statistics:")
+    final_stats = bot.get_system_stats()
+    print(json.dumps(final_stats, indent=2, default=str))
+
+if __name__ == "__main__":
+    main()
